@@ -63,7 +63,7 @@ def compute_policy_loss_power_grpo(
     pg_loss = agg_loss(
         loss_mat=pg_losses,
         loss_mask=response_mask,
-        loss_agg_mode="seq-mean-token-sum",  # GRPO style, NOT token-mean
+        loss_agg_mode=loss_agg_mode,
         **config.global_batch_info
     )
     
@@ -74,7 +74,7 @@ def compute_policy_loss_power_grpo(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
         "actor/length_alpha": length_alpha,
     }
-    
+
     return pg_loss, pg_metrics
 
 
@@ -83,4 +83,4 @@ if __name__ == "__main__":
     
     # Check registration
     assert "power_grpo" in POLICY_LOSS_REGISTRY
-    print("✓ Policy loss 'power_grpo' registered successfully")
+    print("Policy loss 'power_grpo' registered successfully")

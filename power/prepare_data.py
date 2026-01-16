@@ -3,11 +3,11 @@ Unified data preparation script for math RL training.
 Generates both test (validation) and training datasets with decontamination.
 
 Usage:
-    python prepare_data.py                  # Test data only
-    python prepare_data.py --train simplerl # Test + simplerl training data
-    python prepare_data.py --train dapo     # Test + dapo training data  
-    python prepare_data.py --train openr1   # Test + openr1 training data
-    python prepare_data.py --force-test     # Force regenerate test data
+    python3 prepare_data.py                  # Test data only
+    python3 prepare_data.py --train simplerl # Test + simplerl training data
+    python3 prepare_data.py --train dapo     # Test + dapo training data  
+    python3 prepare_data.py --train openr1   # Test + openr1 training data
+    python3 prepare_data.py --force-test     # Force regenerate test data
 """
 
 import argparse

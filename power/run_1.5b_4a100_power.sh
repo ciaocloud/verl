@@ -15,7 +15,7 @@ VAL_DATA="${DATA_DIR}/tiny_val_100.parquet"
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=rloo_batch_std \
     actor_rollout_ref.actor.policy_loss.loss_mode=power_grpo \
-    actor_rollout_ref.actor.policy_loss.length_alpha=0.5 \
+    +actor_rollout_ref.actor.policy_loss.length_alpha=0.5 \
     algorithm.use_kl_in_reward=False \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \

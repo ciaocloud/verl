@@ -5,11 +5,11 @@ export N_GPUS=4
 export BASE_MODEL="Qwen/Qwen2.5-7B-Instruct"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl_power_grpo'
-export EXP_NAME="power-rloo-batch-7b-simpleRL"
+export EXP_NAME="power-rloo-batch-7b-dapomath"
 export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
 
-TRAIN_DATA="${DATA_DIR}/train_simplerl.parquet"
+TRAIN_DATA="${DATA_DIR}/train_dapo.parquet"
 VAL_DATA="${DATA_DIR}/tiny_val_100.parquet"
 
 max_prompt_length=$((1024 * 2))

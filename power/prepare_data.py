@@ -121,11 +121,7 @@ def prepare_test_data():
         # Apply filter if provided
         if filter_fn:
             ds = ds.filter(filter_fn)
-        
-        # Limit olympiad_bench and minerva to 200 samples
-        if data_source in ["olympiad_bench", "minerva"]:
-            ds = ds.select(range(min(200, len(ds))))
-        
+
         # Convert to VeRL format
         for ex in ds:
             sample = make_verl_format(ex[q_key], ex[a_key], data_source, "test")

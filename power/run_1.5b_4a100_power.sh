@@ -5,11 +5,11 @@ export N_GPUS=4
 export BASE_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl_power_grpo'
-export EXP_NAME="grpo-1.5b-simpleRL-power-rloo-batch"
+export EXP_NAME="power-rloo-batch-1.5b-dapomath"
 export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
 
-TRAIN_DATA="${DATA_DIR}/train_simplerl.parquet"
+TRAIN_DATA="${DATA_DIR}/train_dapo.parquet"
 VAL_DATA="${DATA_DIR}/tiny_val_100.parquet"
 
 python3 -m verl.trainer.main_ppo \

@@ -1954,6 +1954,7 @@ def compute_policy_loss_bypass_mode(
 
 
 # =============================================================================
-# Custom policy losses (imported to register)
+# Custom algorithms (imported to register)
 # =============================================================================
-from verl.trainer.ppo import power_grpo 
+from verl.trainer.ppo import power_grpo  # noqa: F401 - Custom policy loss
+from verl.trainer.ppo import grpo_batch_std  # noqa: F401 - Custom advantage estimator

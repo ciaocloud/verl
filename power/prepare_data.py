@@ -24,15 +24,8 @@ TEST_DATA_FILE = "test.parquet"
 NGRAM_SIZE = 10          # Size of n-grams (10 is standard for decontamination)
 OVERLAP_THRESHOLD = 0.5  # Jaccard similarity threshold (0.5 = 50% overlap)
 
-# Qwen-Math Native Template (expects \boxed{} output)
-QWEN_TEMPLATE = (
-    "<|im_start|>system\n"
-    "Please reason step by step, and put your final answer within \\boxed{{}}.<|im_end|>\n"
-    "<|im_start|>user\n"
-    "{question}<|im_end|>\n"
-    "<|im_start|>assistant\n"
-    "<|im_start|>think\n"
-)
+# System prompt for math reasoning (VeRL applies chat template automatically)
+MATH_SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
 
 # Test dataset configurations: (hf_path, split, question_key, answer_key, data_source, filter_fn)
 TEST_DATASETS = [
@@ -95,14 +88,21 @@ def ngram_overlap(ngrams1, ngrams2):
 
 
 def make_verl_format(question, answer, data_source, split="test"):
-    """Create VeRL-compatible sample format."""
+    """Create VeRL-compatible sample format.
+    
+    Uses proper message format - VeRL's tokenizer.apply_chat_template() 
+    will handle the actual formatting for the target model.
+    """
     answer = clean_answer(answer)
     return {
-        "prompt": [{"role": "user", "content": QWEN_TEMPLATE.format(question=question)}],
+        "prompt": [
+            {"role": "system", "content": MATH_SYSTEM_PROMPT},
+            {"role": "user", "content": question}
+        ],
         "ability": "math",
         "reward_model": {"style": "rule", "ground_truth": answer},
         "data_source": data_source,
-        "extra_info": {"split": split, "original_question": question}
+        "extra_info": {"split": split, "index": 0, "original_question": question}
     }
 
 

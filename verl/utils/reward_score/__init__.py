@@ -45,12 +45,7 @@ def default_compute_score(
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
-    elif data_source in [
-        "lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500",
-        # Custom aliases - all use \boxed{} format so use math_reward
-        "simplerl", "dapo", "openr1",  # Training datasets
-        "math500", "amc23", "olympiad_bench", "minerva",  # Test benchmarks
-    ] or data_source.startswith("aime"):
+    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
         from . import math_reward
 
         res = math_reward.compute_score(solution_str, ground_truth)

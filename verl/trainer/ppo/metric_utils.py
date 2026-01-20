@@ -221,6 +221,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    # Log reward extra info metrics (acc, format_ok, etc from enhanced reward functions)
+    if "acc" in batch.non_tensor_batch:
+        acc = np.array(batch.non_tensor_batch["acc"], dtype=float)
+        metrics["reward/acc"] = float(np.mean(acc))
+    
+    if "format_ok" in batch.non_tensor_batch:
+        format_ok = np.array(batch.non_tensor_batch["format_ok"], dtype=float)
+        metrics["reward/format_rate"] = float(np.mean(format_ok))
+
     return metrics
 
 

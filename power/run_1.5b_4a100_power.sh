@@ -13,6 +13,8 @@ TRAIN_DATA="${DATA_DIR}/train_dapo.parquet"
 VAL_DATA="${DATA_DIR}/tiny_val_100.parquet"
 
 python3 -m verl.trainer.main_ppo \
+    custom_reward_function.path=verl/power/reward.py \
+    custom_reward_function.name=compute_score \
     algorithm.adv_estimator=rloo_batch_std \
     actor_rollout_ref.actor.policy_loss.loss_mode=power_grpo \
     +actor_rollout_ref.actor.policy_loss.length_alpha=0.5 \

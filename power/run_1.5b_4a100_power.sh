@@ -5,12 +5,14 @@ export N_GPUS=4
 export BASE_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl_power_grpo'
-export EXP_NAME="power-rloo-batch-1.5b-dapomath"
+export EXP_NAME="power-rloo-batch-1.5b-simplerl-template-fix"
 export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
 
-TRAIN_DATA="${DATA_DIR}/train_dapo.parquet"
+TRAIN_DATA="${DATA_DIR}/train_simplerl.parquet"
 VAL_DATA="${DATA_DIR}/tiny_val_100.parquet"
+validation_data_dir="/workspace/testlog/val"
+rollout_data_dir="/workspace/testlog/rollout"
 
 python3 -m verl.trainer.main_ppo \
     custom_reward_function.path=verl/power/reward.py \
@@ -58,6 +60,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=10 \
+    trainer.log_val_generations=1 \
+    trainer.validation_data_dir=$validation_data_dir \
+    trainer.rollout_data_dir=$rollout_data_dir \
     trainer.project_name=$PROJ_NAME \
     trainer.experiment_name=$EXP_NAME \
     trainer.total_epochs=3 > log_${EXP_NAME}.txt

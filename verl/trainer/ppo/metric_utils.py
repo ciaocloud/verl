@@ -124,21 +124,6 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     non_aborted_sequence_score = sequence_score[non_aborted_mask]
     non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
 
-    custom_metrics = {}
-    aux_keys = ['accuracy', 'format_valid'] 
-    for key in aux_keys:
-        if key in batch.batch:
-            metric_tensor = batch.batch[key]
-            
-            if metric_tensor.dtype != torch.float32:
-                metric_tensor = metric_tensor.float()
-
-            valid_metric = metric_tensor[non_aborted_mask]
-            if valid_metric.numel() > 0:
-                custom_metrics[f'reward/{key}'] = torch.mean(valid_metric).detach().item()
-            else:
-                custom_metrics[f'reward/{key}'] = 0.0
-
     score_mean = torch.mean(non_aborted_sequence_score).detach().item()
     score_max = torch.max(non_aborted_sequence_score).detach().item()
     score_min = torch.min(non_aborted_sequence_score).detach().item()
@@ -222,8 +207,6 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
-
-    metrics.update(custom_metrics)
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:

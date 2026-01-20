@@ -5,18 +5,20 @@ export N_GPUS=4
 export BASE_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl_power_grpo'
-export EXP_NAME="power-rloo-batch-1.5b-simplerl-template-fix"
+export EXP_NAME="power-rloo-batch-1.5b-gsm8k"
 export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
 
-TRAIN_DATA="${DATA_DIR}/train_simplerl.parquet"
-VAL_DATA="${DATA_DIR}/tiny_val_100.parquet"
+TRAIN_DATA="${DATA_DIR}/gsm8k/train.parquet"
+VAL_DATA="${DATA_DIR}/gsm8k/test.parquet"
+# TRAIN_DATA="${DATA_DIR}/train_simplerl.parquet"
+# VAL_DATA="${DATA_DIR}/tiny_val_100.parquet"
 validation_data_dir="/workspace/testlog/val"
 rollout_data_dir="/workspace/testlog/rollout"
 
 python3 -m verl.trainer.main_ppo \
-    custom_reward_function.path=verl/power/reward.py \
-    custom_reward_function.name=compute_score \
+    # custom_reward_function.path=verl/power/reward.py \
+    # custom_reward_function.name=compute_score \
     algorithm.adv_estimator=rloo_batch_std \
     actor_rollout_ref.actor.policy_loss.loss_mode=power_grpo \
     +actor_rollout_ref.actor.policy_loss.length_alpha=0.5 \

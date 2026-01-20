@@ -28,13 +28,15 @@ import random
 import wandb
 
 # Check if math_verify is available
-try:
-    from verl.utils.reward_score import math_verify
-    MATH_VERIFY_AVAILABLE = True
-except ImportError:
-    MATH_VERIFY_AVAILABLE = False
-    print("[power/reward.py] math-verify not installed. Falling back to string matching.")
-    print("  For better accuracy, run: pip install math-verify")
+# FORCE DISABLE math_verify for now to ensure training stability on remote
+MATH_VERIFY_AVAILABLE = False
+# try:
+#     from verl.utils.reward_score import math_verify
+#     MATH_VERIFY_AVAILABLE = True
+# except ImportError:
+#     MATH_VERIFY_AVAILABLE = False
+#     print("[power/reward.py] math-verify not installed. Falling back to string matching.")
+#     print("  For better accuracy, run: pip install math-verify")
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):

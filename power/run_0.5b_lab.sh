@@ -63,4 +63,3 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name=$PROJ_NAME \
     trainer.experiment_name=$EXP_NAME \
     trainer.total_epochs=3 > log_${EXP_NAME}.txt
-

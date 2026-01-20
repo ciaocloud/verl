@@ -65,6 +65,12 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
+def np_converter(obj):
+    if isinstance(obj, (np.int64, np.int32)):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError
 
 @dataclass
 class ResourcePoolManager:
@@ -458,7 +464,7 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            lines.append(json.dumps(entry, ensure_ascii=False, default=np_converter))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")

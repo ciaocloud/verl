@@ -6,95 +6,105 @@ Usage in config:
         path: verl/power/reward.py
         name: compute_score
 
-Features:
-- Uses math_verify for robust symbolic equivalence checking
-  (handles: \\frac{1}{2} vs 0.5, symbolic expressions, etc.)
-- Falls back to string matching if math_verify not installed
-- Tracks format_ok: whether \\boxed{} was found
-- Returns extracted prediction for debugging
-
-Note on precision:
-    math_verify uses SymPy for symbolic comparison, which handles:
-    - Exact fractions: 1/2 == 0.5 == \\frac{1}{2}
-    - Symbolic equivalence: (x+1)^2 == x^2+2x+1
-    - For pure floats, it uses numerical tolerance (~1e-6)
+Strategy:
+1. Try math_verify (symbolic equivalence) - handles fractions, expressions, decimals
+2. Fallback to math_dapo normalization - handles units, text, x=-1
 
 Requirements:
     pip install math-verify
 """
 
-from verl.utils.reward_score import math_reward
+from verl.utils.reward_score import math_dapo
 import random
-import wandb
+import os
 
-# Check if math_verify is available
-# FORCE DISABLE math_verify for now to ensure training stability on remote
+# Debug log file (print doesn't work in Ray workers)
+DEBUG_LOG_FILE = os.environ.get("REWARD_DEBUG_LOG", "/tmp/reward_debug.log")
+
+def debug_log(msg):
+    try:
+        with open(DEBUG_LOG_FILE, "a") as f:
+            f.write(msg + "\n")
+    except:
+        pass
+
+# Use math-verify library DIRECTLY with parse() and verify() API
 MATH_VERIFY_AVAILABLE = False
-# try:
-#     from verl.utils.reward_score import math_verify
-#     MATH_VERIFY_AVAILABLE = True
-# except ImportError:
-#     MATH_VERIFY_AVAILABLE = False
-#     print("[power/reward.py] math-verify not installed. Falling back to string matching.")
-#     print("  For better accuracy, run: pip install math-verify")
+try:
+    from math_verify import parse, verify
+    MATH_VERIFY_AVAILABLE = True
+    debug_log("[INIT] math-verify parse/verify API loaded")
+except ImportError as e:
+    debug_log(f"[INIT] math-verify NOT available: {e}")
+except Exception as e:
+    debug_log(f"[INIT] math-verify init error: {type(e).__name__}: {e}")
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
-    """Compute math reward with detailed metrics.
+    """Compute math reward using existing VeRL modules.
     
-    Uses math_verify for robust symbolic equivalence when available,
-    falls back to string matching otherwise.
+    Strategy:
+    1. math_verify: symbolic equivalence (handles 0.5 == 1/2, expressions)
+    2. math_dapo: string matching fallback (handles units, text, x=-1)
     
-    Signature matches VeRL's custom reward function interface.
-    
-    Returns:
-        dict with:
-            - score: float (0.0 or 1.0) - the reward used for training
-            - acc: bool - same as score, just for logging convenience
-            - format_ok: bool - whether \\boxed{} was found (for diagnostics)
-            - pred: str or None - the extracted prediction (for debugging)
+    Uses math_dapo functions for boxed extraction (consistent with dapo normalization).
+    Returns 0/1 rewards (not -1/1 like original math_dapo).
     """
     format_ok = False
     pred = None
     score = 0.0
     
     try:
-        # Extract \boxed{} for format tracking
-        string_in_last_boxed = math_reward.last_boxed_only_string(solution_str)
+        # Extract \boxed{} using math_dapo functions
+        string_in_last_boxed = math_dapo.last_boxed_only_string(solution_str)
         if string_in_last_boxed is not None:
             format_ok = True
-            pred = math_reward.remove_boxed(string_in_last_boxed)
+            pred = math_dapo.remove_boxed(string_in_last_boxed)
         
-        # Check equivalence
-        if MATH_VERIFY_AVAILABLE:
-            # Use math_verify for robust symbolic equivalence
-            score = math_verify.compute_score(solution_str, ground_truth)
-        else:
-            # Fallback to string matching (less robust but works without deps)
-            if pred is not None and math_reward.is_equiv(pred, ground_truth):
-                score = 1.0
-    except Exception:
-        pass
+        # Method 1: Try math-verify (symbolic equivalence) - using parse/verify API
+        # Normalize GT first to handle "x = -1" -> "-1", "100 dollars" -> "100"
+        if MATH_VERIFY_AVAILABLE and pred is not None:
+            try:
+                gt_clean = math_dapo.normalize_final_answer(ground_truth)
+                # Parse raw values directly with timeout disabled for Ray threads
+                # Wrap in \boxed{} to ensure LatexExtractionConfig picks it up!
+                gold_parsed = parse(f"\\boxed{{{gt_clean}}}", parsing_timeout=None)
+                pred_parsed = parse(f"\\boxed{{{pred}}}", parsing_timeout=None)
+                
+                # verify(gold, answer) - order matters!
+                if verify(gold_parsed, pred_parsed):
+                    score = 1.0
+                else:
+                     # Debug failed verification for exact matches
+                     if gt_clean == pred and random.random() < 0.1:
+                         debug_log(f"[VERIFY FAIL] exact match failed! gt='{gt_clean}' | gold_parsed='{gold_parsed}' | pred_parsed='{pred_parsed}'")
+            except Exception as e:
+                # Log actual errors (e.g. parsing failures)
+                if random.random() < 0.01:
+                    debug_log(f"[math_verify ERROR] {type(e).__name__}: {e}")
+                score = 0.0
+        
+        # Method 2: Fallback to math_dapo normalization
+        # Normalize both pred and GT, then compare. Essential if math_verify fails or is unavailable.
+        # if score < 0.5 and pred is not None:
+        #     pred_norm = math_dapo.normalize_final_answer(pred)
+        #     gt_norm = math_dapo.normalize_final_answer(ground_truth)
+        #     if pred_norm == gt_norm:
+        #         score = 1.0
+        
+        # Debug logging (10% sample) - check EXACT match cases and who provided the score
+        if random.random() < 0.10:
+            gt_norm = math_dapo.normalize_final_answer(ground_truth)
+            pred_norm = math_dapo.normalize_final_answer(pred) if pred else None
+            is_exact = (pred_norm == gt_norm) if pred_norm else False
+            debug_log(f"[reward] score={score} | gt_norm='{gt_norm}' | pred='{pred}' | exact={is_exact} | verify_avail={MATH_VERIFY_AVAILABLE}")
+                
+    except Exception as e:
+        if random.random() < 0.001:
+            debug_log(f"[Reward Error] {type(e).__name__}: {e}")
 
-    score = float(score)
-    acc = 1.0 if score >= 0.5 else 0.0        # float for accuracy
-    format_ok = 1.0 if format_ok else 0.0     # float for format rate
-    
-    # HACK: Log 0.01% of training samples directly to WandB
-    if random.random() < 0.0001: 
-        try:
-            print(f"\n[TRAIN SAMPLE] GT: {ground_truth} | Format: {format_ok}\nOutput: {solution_str}\n")
-            if wandb.run is not None:
-                wandb.log({
-                    "train_sample_text": wandb.Html(f"<p><b>GT:</b> {ground_truth}</p><p><b>Gen:</b> {solution_str}</p>")
-                })
-        except Exception:
-            pass
-
-    # Return dict with metrics
-    # NOTE: If you get JSON serialization errors, remove 'trainer.rollout_data_dir' from config
     return {
-        "score": score,
-        "acc": acc,
-        "format_ok": format_ok,
+        "score": float(score),
+        "acc": 1.0 if score >= 0.5 else 0.0,
+        "format_ok": 1.0 if format_ok else 0.0,
     }

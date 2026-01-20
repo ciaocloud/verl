@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+# Experiment config
+MODEL_SIZE="0.5B"
+DATASET="simplerl"
+DATE=$(date +%m%d)  # MMDDHH format (e.g., 012014)
+
 export N_GPUS=1
-export BASE_MODEL="Qwen/Qwen2.5-0.5B-Instruct"
+export BASE_MODEL="Qwen/Qwen2.5-${MODEL_SIZE}-Instruct"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl_power_grpo'
-export EXP_NAME="GRPO-0.5B-simpleRL"
+export EXP_NAME="GRPO-${MODEL_SIZE}-${DATASET}-${DATE}"
+
 export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
 
-TRAIN_DATA="${DATA_DIR}/train_simplerl.parquet"
+TRAIN_DATA="${DATA_DIR}/train_${DATASET}.parquet"
 VAL_DATA="${DATA_DIR}/tiny_val_100.parquet"
 validation_data_dir="/testlog/val"
 rollout_data_dir="/testlog/rollout"
@@ -52,7 +58,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     trainer.logger=['console','tensorboard'] \
-    trainer.log_val_generations=3 \
+    trainer.log_val_generations=1 \
     trainer.validation_data_dir=$validation_data_dir \
     trainer.rollout_data_dir=$rollout_data_dir \
     trainer.val_before_train=True \

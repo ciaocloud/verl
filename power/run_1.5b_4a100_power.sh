@@ -5,10 +5,16 @@ export N_GPUS=4
 export BASE_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl_power_grpo'
-export EXP_NAME="power-rloo-batch-1.5b-gsm8k"
+
+# Dataset and date in experiment name for easy tracking
+DATASET="gsm8k"  # Change to: simplerl, gsm8k, etc.
+DATE=$(date +%m%d)
+export EXP_NAME="power-1.5B-${DATASET}-${DATE}"
+
 export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
 
+# Dataset paths (uncomment the one you want)
 TRAIN_DATA="${DATA_DIR}/gsm8k/train.parquet"
 VAL_DATA="${DATA_DIR}/gsm8k/test.parquet"
 # TRAIN_DATA="${DATA_DIR}/train_simplerl.parquet"

@@ -5,7 +5,7 @@ export N_GPUS=1
 export BASE_MODEL="Qwen/Qwen2.5-0.5B-Instruct"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl_power_grpo'
-export EXP_NAME="GRPO-0.5B-simpleRL-1"
+export EXP_NAME="GRPO-0.5B-simpleRL"
 export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
 

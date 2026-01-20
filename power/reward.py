@@ -24,6 +24,8 @@ Requirements:
 """
 
 from verl.utils.reward_score import math_reward
+import random
+import wandb
 
 # Check if math_verify is available
 try:
@@ -76,6 +78,21 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
     acc = int(score >= 0.5)        # 1 if correct, 0 if wrong
     format_ok = int(format_ok)     # 1 if \boxed{} found, 0 otherwise
     
+    # HACK: Log 0.1% of training samples directly to WandB
+    # Note: This works best if your workers have internet access/wandb login.
+    # If using Ray on a cluster, this might print to the Ray Dashboard stdout instead.
+    if random.random() < 0.001: 
+        try:
+            # Option A: Print to console (safest for Ray clusters)
+            print(f"\n[TRAIN SAMPLE] GT: {ground_truth}\nOutput: {solution_str}\n")
+            # Option B: Send to WandB (if configured on workers)
+            if wandb.run is not None:
+                wandb.log({
+                    "train_sample_text": wandb.Html(f"<p><b>GT:</b> {ground_truth}</p><p><b>Gen:</b> {solution_str}</p>")
+                })
+        except Exception:
+            pass
+
     return {
         "score": score,
         "acc": acc,

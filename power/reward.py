@@ -80,8 +80,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
     acc = 1.0 if score >= 0.5 else 0.0        # float for accuracy
     format_ok = 1.0 if format_ok else 0.0     # float for format rate
     
-    # HACK: Log 0.1% of training samples directly to WandB
-    if random.random() < 0.001: 
+    # HACK: Log 0.01% of training samples directly to WandB
+    if random.random() < 0.0001: 
         try:
             print(f"\n[TRAIN SAMPLE] GT: {ground_truth} | Format: {format_ok}\nOutput: {solution_str}\n")
             if wandb.run is not None:

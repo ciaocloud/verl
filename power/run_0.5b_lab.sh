@@ -65,8 +65,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=True \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=10 \
+    trainer.save_freq=1 \
     trainer.test_freq=10 \
     trainer.project_name=$PROJ_NAME \
     trainer.experiment_name=$EXP_NAME \
+    trainer.default_local_dir="/dev/shm/verl_ckpt/${EXP_NAME}" \
     trainer.total_epochs=3 > log_${EXP_NAME}.txt

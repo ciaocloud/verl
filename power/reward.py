@@ -41,7 +41,7 @@ MATH_VERIFY_AVAILABLE = False
 
 MATH_METRICS_AVAILABLE = False
 try:
-    from metric import math_metric, timeout
+    from power.metric import math_metric, timeout
     debug_log("[INIT] self math_metric loaded")
     from math_verify.errors import TimeoutException
     from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
@@ -83,9 +83,9 @@ def compute_score(data_source, solution_str, ground_truth, timeout_seconds=5, ex
             )
             verify_fn = timeout(timeout_seconds)(verify_fn)
             try:
-                ground_truth_boxed = "\\boxed{" + ground_truth + "}"
-                score, _ = verify_fn([ground_truth_boxed], [string_in_last_boxed])
-                debug_log(f"[++++score++++]: ]{score}")
+                gt_boxed = "\\boxed{" + ground_truth + "}"
+                score, _ = verify_fn([gt_boxed], [string_in_last_boxed])
+                debug_log(f"[score]: ]{score} | gt_boxed = '{gt_boxed} | string_in_last_boxed = '{string_in_last_boxed}")
             except Exception as e:
                 # if random.random() < 0.01:
                 debug_log(f"[math_metric ERROR] {type(e).__name__}: {e}")
@@ -93,14 +93,6 @@ def compute_score(data_source, solution_str, ground_truth, timeout_seconds=5, ex
             except TimeoutException:
                 debug_log("[TimeoutException]")
                 score = 0.0
-        
-        if random.random() < 0.10 and MATH_METRICS_AVAILABLE:
-            debug_log("======================================================")
-            debug_log(f"---> ground_truth = '{ground_truth}'")
-            debug_log(f"---> ground_truth_boxed = '{ground_truth_boxed}'")
-            debug_log(f"---> solution_str = '{solution_str}'")
-            debug_log(f"---> string_in_last_boxed = '{string_in_last_boxed}'")
-            debug_log("======================================================")
 
         # Method 1: Try math-verify (symbolic equivalence) - using parse/verify API
         # Normalize GT first to handle "x = -1" -> "-1", "100 dollars" -> "100"

@@ -6,6 +6,7 @@ MODEL_SIZE="0.5B"
 DATASET="simplerl"
 DATE=$(date +%m%d)  # MMDDHH format (e.g., 012014)
 
+export GOOGLE_APPLICATION_CREDENTIALS=/wx-gcs-key.json 
 export N_GPUS=1
 export BASE_MODEL="Qwen/Qwen2.5-${MODEL_SIZE}-Instruct"
 export DATA_DIR="/workspace/data"

@@ -30,17 +30,29 @@ def debug_log(msg):
 
 # Use math-verify library DIRECTLY with parse() and verify() API
 MATH_VERIFY_AVAILABLE = False
+# try:
+#     from math_verify import parse, verify
+#     MATH_VERIFY_AVAILABLE = True
+#     debug_log("[INIT] math-verify parse/verify API loaded")
+# except ImportError as e:
+#     debug_log(f"[INIT] math-verify NOT available: {e}")
+# except Exception as e:
+#     debug_log(f"[INIT] math-verify init error: {type(e).__name__}: {e}")
+
+MATH_METRICS_AVAILABLE = False
 try:
-    from math_verify import parse, verify
-    MATH_VERIFY_AVAILABLE = True
-    debug_log("[INIT] math-verify parse/verify API loaded")
+    from metric import math_metric, timeout
+    debug_log("[INIT] self math_metric loaded")
+    from math_verify.errors import TimeoutException
+    from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+    debug_log("[INIT] other math_verify loaded")
+    MATH_METRICS_AVAILABLE = True
 except ImportError as e:
-    debug_log(f"[INIT] math-verify NOT available: {e}")
+    debug_log(f"[INIT] self math_metric NOT available: {e}")
 except Exception as e:
-    debug_log(f"[INIT] math-verify init error: {type(e).__name__}: {e}")
+    debug_log(f"[INIT] self math_metric init error: {type(e).__name__}: {e}")
 
-
-def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
+def compute_score(data_source, solution_str, ground_truth, timeout_seconds=5, extra_info=None, **kwargs):
     """Compute math reward using existing VeRL modules.
     
     Strategy:
@@ -60,7 +72,36 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
         if string_in_last_boxed is not None:
             format_ok = True
             pred = math_dapo.remove_boxed(string_in_last_boxed)
+
+        if MATH_METRICS_AVAILABLE and pred is not None:
+            verify_fn = math_metric(
+                gold_extraction_target=(LatexExtractionConfig(),),
+                pred_extraction_target=(
+                    ExprExtractionConfig(),
+                    LatexExtractionConfig(),
+                ),
+            )
+            verify_fn = timeout(timeout_seconds)(verify_fn)
+            try:
+                ground_truth_boxed = "\\boxed{" + ground_truth + "}"
+                score, _ = verify_fn([ground_truth_boxed], [string_in_last_boxed])
+                debug_log(f"[++++score++++]: ]{score}")
+            except Exception as e:
+                # if random.random() < 0.01:
+                debug_log(f"[math_metric ERROR] {type(e).__name__}: {e}")
+                score = 0.0
+            except TimeoutException:
+                debug_log("[TimeoutException]")
+                score = 0.0
         
+        if random.random() < 0.10 and MATH_METRICS_AVAILABLE:
+            debug_log("======================================================")
+            debug_log(f"---> ground_truth = '{ground_truth}'")
+            debug_log(f"---> ground_truth_boxed = '{ground_truth_boxed}'")
+            debug_log(f"---> solution_str = '{solution_str}'")
+            debug_log(f"---> string_in_last_boxed = '{string_in_last_boxed}'")
+            debug_log("======================================================")
+
         # Method 1: Try math-verify (symbolic equivalence) - using parse/verify API
         # Normalize GT first to handle "x = -1" -> "-1", "100 dollars" -> "100"
         if MATH_VERIFY_AVAILABLE and pred is not None:
@@ -93,7 +134,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
         #         score = 1.0
         
         # Debug logging (10% sample) - check EXACT match cases and who provided the score
-        if random.random() < 0.10:
+        if random.random() < 0.10 and MATH_VERIFY_AVAILABLE:
             gt_norm = math_dapo.normalize_final_answer(ground_truth)
             pred_norm = math_dapo.normalize_final_answer(pred) if pred else None
             is_exact = (pred_norm == gt_norm) if pred_norm else False

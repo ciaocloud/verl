@@ -18,13 +18,14 @@ from pathlib import Path
 
 from google.cloud import storage
 
-BUCKET_NAME = "wx-verl-checkpoints"
+BUCKET_NAME = "gogo-verl-checkpoints"
+# BUCKET_NAME = "wx-verl-checkpoints"
 DEFAULT_WATCH_DIR = "/dev/shm/verl_ckpt"
-DEFAULT_CREDENTIALS = "/wx-gcs-key.json"
+# DEFAULT_CREDENTIALS = "/wx-gcs-key.json"
 
-# Set default credentials if not in env
-if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") and os.path.exists(DEFAULT_CREDENTIALS):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = DEFAULT_CREDENTIALS
+# # Set default credentials if not in env
+# if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") and os.path.exists(DEFAULT_CREDENTIALS):
+#     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = DEFAULT_CREDENTIALS
 
 
 class GCSWatcher:

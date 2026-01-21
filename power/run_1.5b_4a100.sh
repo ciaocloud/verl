@@ -5,12 +5,14 @@ export N_GPUS=4
 export BASE_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl_power_grpo'
-export EXP_NAME="grpo-1.5b-simpleRL-fix"
+export EXP_NAME="grpo-1.5b-simpleRL-template-fix"
 export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
 
 TRAIN_DATA="${DATA_DIR}/train_simplerl.parquet"
 VAL_DATA="${DATA_DIR}/tiny_val_100.parquet"
+validation_data_dir="/workspace/testlog/val"
+rollout_data_dir="/workspace/testlog/rollout"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \

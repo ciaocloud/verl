@@ -225,12 +225,55 @@ def prepare_train_data(dataset_choice, test_samples):
     print(f"{'='*40}")
 
 
+def prepare_tiny_validation(all_samples):
+    """Create a balanced subset of 128 samples for faster validation."""
+    print("\n" + "="*60)
+    print("PREPARING TINY VALIDATION SET (128 samples)")
+    print("="*60)
+    
+    df = pd.DataFrame(all_samples)
+    
+    # Target counts for 128 total
+    targets = {
+        "math500": 40,
+        "olympiad_bench": 40,
+        "minerva": 24,
+        "aime24": 8,
+        "aime25": 8,
+        "amc23": 8
+    }
+    
+    tiny_samples = []
+    
+    for source, count in targets.items():
+        subset = df[df['data_source'] == source]
+        available = len(subset)
+        
+        if available == 0:
+            print(f"Warning: No samples found for {source}")
+            continue
+            
+        n = min(count, available)
+        sampled = subset.sample(n=n, random_state=42) # Fixed seed for reproducibility
+        tiny_samples.append(sampled)
+        print(f"  {source}: {n}/{count} (from {available} total)")
+        
+    tiny_df = pd.concat(tiny_samples)
+    tiny_df = tiny_df.sample(frac=1, random_state=42).reset_index(drop=True) # Shuffle
+    
+    output_file = "test_128.parquet"
+    tiny_df.to_parquet(output_file)
+    print(f"\n✅ Saved {len(tiny_df)} tiny test samples to '{output_file}'")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Prepare math RL training/test data")
     parser.add_argument("--train", type=str, choices=["simplerl", "dapo", "openr1"],
                         help="Training dataset to prepare")
     parser.add_argument("--force-test", action="store_true",
                         help="Force regenerate test data even if file exists")
+    parser.add_argument("--tiny", action="store_true",
+                        help="Generate a tiny 128-sample validation set")
     args = parser.parse_args()
     
     # Smart default: load existing test data if available, generate if not
@@ -240,6 +283,9 @@ def main():
         test_samples = prepare_test_data()
     else:
         test_samples = load_existing_test_data()
+    
+    if args.tiny:
+        prepare_tiny_validation(test_samples)
     
     # Generate training data if requested
     if args.train:

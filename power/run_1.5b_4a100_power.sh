@@ -15,9 +15,9 @@ export EXP_NAME="${ALGS}-${MODEL_SIZE}-${DATASET}-${DATE}"
 export CKPT_DIR="/dev/shm/verl_ckpt/${EXP_NAME}"
 
 TRAIN_DATA="${DATA_DIR}/train_${DATASET}.parquet"
-VAL_DATA="${DATA_DIR}/test.parquet"
-validation_data_dir="/workspace/testlog/val/${EXP_NAME}"
-rollout_data_dir="/workspace/testlog/rollout/${EXP_NAME}"
+VAL_DATA="${DATA_DIR}/test_128.parquet"
+# validation_data_dir="/workspace/testlog/val/${EXP_NAME}"
+# rollout_data_dir="/workspace/testlog/rollout/${EXP_NAME}"
 
 export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
@@ -72,9 +72,6 @@ nohup python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
     trainer.test_freq=10 \
-    trainer.log_val_generations=1 \
-    trainer.validation_data_dir=$validation_data_dir \
-    trainer.rollout_data_dir=$rollout_data_dir \
     trainer.project_name=$PROJ_NAME \
     trainer.experiment_name=$EXP_NAME \
     trainer.default_local_dir=$CKPT_DIR \

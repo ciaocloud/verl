@@ -18,10 +18,15 @@ export RAY_ADDRESS='local'
 
 TRAIN_DATA="${DATA_DIR}/train_${DATASET}.parquet"
 VAL_DATA="${DATA_DIR}/tiny_val_100.parquet"
-validation_data_dir="/testlog/val"
-rollout_data_dir="/testlog/rollout"
+# validation_data_dir="/testlog/val"
+# rollout_data_dir="/testlog/rollout"
+    # trainer.log_val_generations=1 \
+    # trainer.validation_data_dir=$validation_data_dir \
+    # trainer.rollout_data_dir=$rollout_data_dir \
 
-python3 -m verl.trainer.main_ppo \
+nohup python verl/power/gcs_checkpoint.py --watch $CKPT_DIR 2>&1 &
+
+nohup python3 -m verl.trainer.main_ppo \
     custom_reward_function.path=verl/power/reward.py \
     custom_reward_function.name=compute_score \
     algorithm.adv_estimator=grpo \
@@ -59,9 +64,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     trainer.logger=['console','tensorboard'] \
-    trainer.log_val_generations=1 \
-    trainer.validation_data_dir=$validation_data_dir \
-    trainer.rollout_data_dir=$rollout_data_dir \
     trainer.val_before_train=True \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
@@ -70,4 +72,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name=$PROJ_NAME \
     trainer.experiment_name=$EXP_NAME \
     trainer.default_local_dir="/dev/shm/verl_ckpt/${EXP_NAME}" \
-    trainer.total_epochs=3 > log_${EXP_NAME}.txt
+    trainer.total_epochs=3  2>&1 &

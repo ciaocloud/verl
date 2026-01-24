@@ -12,7 +12,7 @@ export BASE_MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-${MODEL_SIZE}"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='go-verl'
 export EXP_NAME="${ALGS}-${MODEL_SIZE}-${DATASET}-${DATE}"
-export CKPT_DIR="/dev/shm/verl_ckpt/${EXP_NAME}"
+export CKPT_DIR="checkpoints/${PROJ_NAME}/${EXP_NAME}"
 
 TRAIN_DATA="${DATA_DIR}/train_${DATASET}.parquet"
 VAL_DATA="${DATA_DIR}/test_128.parquet"
@@ -23,7 +23,7 @@ export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
 
 # Start async GCS checkpoint uploader in background
-nohup python verl/power/gcs_checkpoint.py --watch $CKPT_DIR > gcs_upload_${EXP_NAME}.log 2>&1 &
+nohup python verl/power/gcs_checkpoint.py --watch $CKPT_DIR 2>&1 &
 
 nohup python3 -m verl.trainer.main_ppo \
     custom_reward_function.path=verl/power/reward.py \
@@ -74,8 +74,7 @@ nohup python3 -m verl.trainer.main_ppo \
     trainer.test_freq=10 \
     trainer.project_name=$PROJ_NAME \
     trainer.experiment_name=$EXP_NAME \
-    trainer.default_local_dir=$CKPT_DIR \
-    trainer.total_epochs=3 > exp_${EXP_NAME}.log 2>&1 &
+    trainer.total_epochs=3 2>&1 &
 
 echo "Training started in background."
 echo "GCS upload logs: gcs_upload_${EXP_NAME}.log"

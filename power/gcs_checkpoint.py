@@ -19,13 +19,14 @@ from pathlib import Path
 from google.cloud import storage
 
 BUCKET_NAME = "gogo-verl-checkpoints"
-# BUCKET_NAME = "wx-verl-checkpoints"
-DEFAULT_WATCH_DIR = "/dev/shm/verl_ckpt"
-# DEFAULT_CREDENTIALS = "/wx-gcs-key.json"
+# DEFAULT_WATCH_DIR = "/dev/shm/verl_ckpt"
+DEFAULT_WATCH_DIR = "checkpoints"
+DEFAULT_CREDENTIALS = "/wx-gcs-key.json"
 
-# # Set default credentials if not in env
-# if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") and os.path.exists(DEFAULT_CREDENTIALS):
-#     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = DEFAULT_CREDENTIALS
+# Set default credentials if file exists
+if os.path.exists(DEFAULT_CREDENTIALS):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = DEFAULT_CREDENTIALS
+    BUCKET_NAME = "wx-verl-checkpoints"
 
 
 class GCSWatcher:
@@ -72,18 +73,36 @@ class GCSWatcher:
     def _upload_file(self, local: Path, gcs_path: str):
         self.bucket.blob(gcs_path).upload_from_filename(str(local))
 
+    def _get_completed_step(self) -> int | None:
+        """Read latest_checkpointed_iteration.txt to get last completed step."""
+        tracker = self.local_dir / "latest_checkpointed_iteration.txt"
+        if tracker.exists():
+            try:
+                content = tracker.read_text().strip()
+                if content:
+                    return int(content)
+            except:
+                pass
+        return None
+
     def _scan(self):
         if not self.local_dir.exists():
             return
+        
+        completed_step = self._get_completed_step()
+        if completed_step is None:
+            return  # Wait for tracker file to be written
+        
         for item in sorted(self.local_dir.iterdir()):
             if not item.is_dir() or not item.name.startswith("global_step_"):
                 continue
             if item.name in self.uploaded:
                 continue
-            if not (item / "actor").exists():
-                continue
             
             step = int(item.name.split("_")[-1])
+            if step > completed_step:
+                continue  # Not yet marked complete
+            
             self.uploaded.add(item.name)
             
             event = threading.Event()
@@ -112,14 +131,15 @@ class GCSWatcher:
 
 
 def main():
+    project_name = os.environ.get("PROJ_NAME")
     exp_name = os.environ.get("EXP_NAME")
-    default_watch = f"{DEFAULT_WATCH_DIR}/{exp_name}" if exp_name else None
+    default_watch = f"{DEFAULT_WATCH_DIR}/{project_name}/{exp_name}" if project_name and exp_name else None
     
     p = argparse.ArgumentParser()
     p.add_argument("--watch", default=default_watch, 
-                   help=f"Local checkpoint dir (default: {DEFAULT_WATCH_DIR}/$EXP_NAME)")
+                   help=f"Local checkpoint dir (default: {DEFAULT_WATCH_DIR}/$PROJ_NAME/$EXP_NAME)")
     p.add_argument("--bucket", default=BUCKET_NAME, help=f"GCS bucket (default: {BUCKET_NAME})")
-    p.add_argument("--interval", type=float, default=30, help="Poll interval seconds")
+    p.add_argument("--interval", type=float, default=180, help="Poll interval seconds")
     args = p.parse_args()
 
     if not args.watch:

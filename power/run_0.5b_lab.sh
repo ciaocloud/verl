@@ -13,7 +13,8 @@ export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl_power_grpo'
 export EXP_NAME="GRPO-${MODEL_SIZE}-${DATASET}-${DATE}"
 
-export CKPT_DIR="/dev/shm/verl_ckpt/${EXP_NAME}"
+# Use verl's default checkpoint path
+export CKPT_DIR="checkpoints/${PROJ_NAME}/${EXP_NAME}"
 export TENSORBOARD_DIR=/workspace/tensorboard_logs/${EXP_NAME}
 export RAY_ADDRESS='local'
 
@@ -69,5 +70,4 @@ nohup python3 -m verl.trainer.main_ppo \
     trainer.test_freq=10 \
     trainer.project_name=$PROJ_NAME \
     trainer.experiment_name=$EXP_NAME \
-    trainer.default_local_dir=$CKPT_DIR \
     trainer.total_epochs=3  2>&1 &

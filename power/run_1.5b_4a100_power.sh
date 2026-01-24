@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-MODEL_SIZE="1.5B"
-DATASET="dapo"
+MODEL_SIZE="Math-1.5B"
+DATASET="dapo17k"
 DATE=$(date +%m%d%H)  # MMDDHH format (e.g., 012015)
 ALGS="power-rloo-batch"
 
 export N_GPUS=4
-# export BASE_MODEL="Qwen/Qwen2.5-${MODEL_SIZE}-Instruct"
-export BASE_MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-${MODEL_SIZE}"
+export BASE_MODEL="Qwen/Qwen2.5-${MODEL_SIZE}"
+# export BASE_MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-${MODEL_SIZE}"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='go-verl'
 export EXP_NAME="${ALGS}-${MODEL_SIZE}-${DATASET}-${DATE}"

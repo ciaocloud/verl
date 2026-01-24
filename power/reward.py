@@ -14,9 +14,7 @@ Requirements:
     pip install math-verify
 """
 
-from verl.utils.reward_score import math_dapo
-import random
-import os
+from verl.utils.reward_score import math_dapo, math_reward
 
 # # Debug log file (print doesn't work in Ray workers)
 # DEBUG_LOG_FILE = os.environ.get("REWARD_DEBUG_LOG", "/tmp/reward_debug.log")
@@ -39,18 +37,18 @@ import os
 # # except Exception as e:
 # #     debug_log(f"[INIT] math-verify init error: {type(e).__name__}: {e}")
 
-# MATH_METRICS_AVAILABLE = False
-# try:
-#     from power.metric import math_metric, timeout
-#     # debug_log("[INIT] self math_metric loaded")
-#     from math_verify.errors import TimeoutException
-#     from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
-#     # debug_log("[INIT] other math_verify loaded")
-#     MATH_METRICS_AVAILABLE = True
-# except ImportError as e:
-#     debug_log(f"[INIT] self math_metric NOT available: {e}")
-# except Exception as e:
-#     debug_log(f"[INIT] self math_metric init error: {type(e).__name__}: {e}")
+MATH_METRICS_AVAILABLE = False
+try:
+    from power.metric import math_metric, timeout
+    from math_verify.errors import TimeoutException
+    from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+    MATH_METRICS_AVAILABLE = True
+except ImportError as e:
+    pass
+    # debug_log(f"[INIT] self math_metric NOT available: {e}")
+except Exception as e:
+    # debug_log(f"[INIT] self math_metric init error: {type(e).__name__}: {e}")
+    pass
 
 def compute_score(data_source, solution_str, ground_truth, timeout_seconds=5, extra_info=None, **kwargs):
     """Compute math reward using existing VeRL modules.
@@ -76,26 +74,27 @@ def compute_score(data_source, solution_str, ground_truth, timeout_seconds=5, ex
             format_ok = True
             pred = math_dapo.remove_boxed(string_in_last_boxed)
 
-    #     if MATH_METRICS_AVAILABLE and pred is not None:
-    #         verify_fn = math_metric(
-    #             gold_extraction_target=(LatexExtractionConfig(),),
-    #             pred_extraction_target=(
-    #                 ExprExtractionConfig(),
-    #                 LatexExtractionConfig(),
-    #             ),
-    #         )
-    #         verify_fn = timeout(timeout_seconds)(verify_fn)
-    #         try:
-    #             gt_boxed = "\\boxed{" + ground_truth + "}"
-    #             score, _ = verify_fn([gt_boxed], [string_in_last_boxed])
-    #             # debug_log(f"[score]: ]{score} | gt_boxed = '{gt_boxed} | string_in_last_boxed = '{string_in_last_boxed}")
-    #         except Exception as e:
-    #             # if random.random() < 0.01:
-    #             # debug_log(f"[math_metric ERROR] {type(e).__name__}: {e}")
-    #             score = 0.0
-    #         except TimeoutException:
-    #             # debug_log("[TimeoutException]")
-    #             score = 0.0
+        # Method 1: Try math-verify (symbolic equivalence) - using parse/verify API
+        if MATH_METRICS_AVAILABLE and pred is not None:
+            verify_fn = math_metric(
+                gold_extraction_target=(LatexExtractionConfig(),),
+                pred_extraction_target=(
+                    ExprExtractionConfig(),
+                    LatexExtractionConfig(),
+                ),
+            )
+            verify_fn = timeout(timeout_seconds)(verify_fn)
+            try:
+                gt_boxed = "\\boxed{" + ground_truth + "}"
+                score, _ = verify_fn([gt_boxed], [string_in_last_boxed])
+                # debug_log(f"[score]: ]{score} | gt_boxed = '{gt_boxed} | string_in_last_boxed = '{string_in_last_boxed}")
+            except Exception as e:
+                # if random.random() < 0.01:
+                # debug_log(f"[math_metric ERROR] {type(e).__name__}: {e}")
+                score = 0.0
+            except TimeoutException:
+                # debug_log("[TimeoutException]")
+                score = 0.0
 
     #     # Method 1: Try math-verify (symbolic equivalence) - using parse/verify API
     #     # Normalize GT first to handle "x = -1" -> "-1", "100 dollars" -> "100"
@@ -120,12 +119,12 @@ def compute_score(data_source, solution_str, ground_truth, timeout_seconds=5, ex
     #                 debug_log(f"[math_verify ERROR] {type(e).__name__}: {e}")
     #             score = 0.0
         
-        # Method 2: Fallback to math_dapo normalization
+        # Method 2: Fallback to math_reward and math_dapo normalization
         # Normalize both pred and GT, then compare. Essential if math_verify fails or is unavailable.
         if score < 0.5 and pred is not None:
-            pred_norm = math_dapo.normalize_final_answer(pred)
-            gt_norm = math_dapo.normalize_final_answer(ground_truth)
-            if pred_norm == gt_norm:
+            if math_reward.is_equiv(pred, ground_truth):
+                score = 1.0
+            elif math_dapo.normalize_final_answer(pred) == math_dapo.normalize_final_answer(ground_truth):
                 score = 1.0
         
         # # Debug logging (10% sample) - check EXACT match cases and who provided the score
@@ -142,6 +141,5 @@ def compute_score(data_source, solution_str, ground_truth, timeout_seconds=5, ex
 
     return {
         "score": float(score),
-        "acc": 1.0 if score >= 0.5 else 0.0,
         "format_ok": 1.0 if format_ok else 0.0,
     }

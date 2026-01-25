@@ -4,6 +4,7 @@ set -xeuo pipefail
 MODEL_SIZE="Math-1.5B"
 DATASET="dapo17k"
 DATE=$(date +%m%d%H)  # MMDDHH format (e.g., 012015)
+# DATE="012413"
 ALGS="power-rloo-batch"
 
 export N_GPUS=4
@@ -67,7 +68,7 @@ nohup python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     trainer.logger=['console','tensorboard'] \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=10 \
@@ -76,6 +77,5 @@ nohup python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=$EXP_NAME \
     trainer.total_epochs=3 2>&1 &
 
-echo "Training started in background."
-echo "GCS upload logs: gcs_upload_${EXP_NAME}.log"
-echo "Monitor logs with: tail -f exp_${EXP_NAME}.log"
+    # trainer.resume_mode=resume_path \
+    # trainer.resume_from_path=${CKPT_DIR}/global_step_140 \

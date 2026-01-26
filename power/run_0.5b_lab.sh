@@ -7,6 +7,7 @@ DATASET="simplerl"
 DATE=$(date +%m%d)  # MMDDHH format (e.g., 012014)
 
 export GOOGLE_APPLICATION_CREDENTIALS=/wx-gcs-key.json 
+export WANDB_API_KEY=$(cat /workspace/wx-wandb-api-key.txt)
 export N_GPUS=1
 export BASE_MODEL="Qwen/Qwen2.5-${MODEL_SIZE}-Instruct"
 export DATA_DIR="/workspace/data"
@@ -61,7 +62,7 @@ nohup python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
-    trainer.logger=['console','tensorboard'] \
+    trainer.logger=['console','tensorboard','wandb'] \
     trainer.log_val_generations=1 \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=$N_GPUS \

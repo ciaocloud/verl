@@ -5,7 +5,7 @@ MODEL_SIZE="Math-1.5B"
 DATASET="dapo17k"
 DATE=$(date +%m%d%H)  # MMDDHH format (e.g., 012015)
 # DATE="012413"
-ALGS="power-rloo-batch"
+ALGS="p1-GRPO-rloo-batch"
 
 export N_GPUS=4
 export BASE_MODEL="Qwen/Qwen2.5-${MODEL_SIZE}"
@@ -31,7 +31,7 @@ nohup python3 -m verl.trainer.main_ppo \
     custom_reward_function.name=compute_score \
     algorithm.adv_estimator=rloo_batch_std \
     actor_rollout_ref.actor.policy_loss.loss_mode=power_grpo \
-    +actor_rollout_ref.actor.policy_loss.length_alpha=0.5 \
+    +actor_rollout_ref.actor.policy_loss.length_alpha=1.0 \
     algorithm.use_kl_in_reward=False \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \

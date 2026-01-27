@@ -7,7 +7,17 @@ Usage:
     python3 prepare_data.py --train simplerl # Test + simplerl training data
     python3 prepare_data.py --train dapo     # Test + dapo training data  
     python3 prepare_data.py --train openr1   # Test + openr1 training data
-    python3 prepare_data.py --force-test     # Force regenerate test data
+    python3 prepare_data.py --no-separate    # Don't save separate test files
+
+Output files:
+    test.parquet          - Combined test set (all sources)
+    math500.parquet       - MATH-500 test set
+    aime24.parquet        - AIME 2024
+    aime25.parquet        - AIME 2025
+    amc23.parquet         - AMC 2023
+    olympiad_bench.parquet - OlympiadBench
+    minerva.parquet       - Minerva Math
+    test_128.parquet      - Tiny validation set (with --tiny)
 """
 
 import argparse
@@ -106,13 +116,14 @@ def make_verl_format(question, answer, data_source, split="test"):
     }
 
 
-def prepare_test_data():
+def prepare_test_data(save_separate=True):
     """Load and format all test/validation datasets."""
     print("\n" + "="*60)
     print("PREPARING TEST DATA")
     print("="*60)
     
     all_samples = []
+    samples_by_source = {}
     
     for hf_path, split, q_key, a_key, data_source, filter_fn in TEST_DATASETS:
         print(f"\nProcessing {data_source} ({hf_path})...")
@@ -123,30 +134,30 @@ def prepare_test_data():
             ds = ds.filter(filter_fn)
 
         # Convert to VeRL format
+        source_samples = []
         for ex in ds:
             sample = make_verl_format(ex[q_key], ex[a_key], data_source, "test")
             all_samples.append(sample)
+            source_samples.append(sample)
         
+        samples_by_source[data_source] = source_samples
         print(f"  Added {len(ds)} samples")
     
-    # Save
+    # Save combined file
     df = pd.DataFrame(all_samples)
     df.to_parquet(TEST_DATA_FILE)
     print(f"\n✅ Saved {len(df)} test samples to '{TEST_DATA_FILE}'")
     
+    # Save separate files per data source
+    if save_separate:
+        print("\nSaving separate files per data source:")
+        for source, samples in samples_by_source.items():
+            source_file = f"{source}.parquet"
+            pd.DataFrame(samples).to_parquet(source_file)
+            print(f"  ✅ {source_file}: {len(samples)} samples")
+    
     return all_samples
 
-
-def load_existing_test_data():
-    """Load test samples from existing parquet file."""
-    print("\n" + "="*60)
-    print(f"LOADING EXISTING TEST DATA: {TEST_DATA_FILE}")
-    print("="*60)
-    
-    df = pd.read_parquet(TEST_DATA_FILE)
-    samples = df.to_dict('records')
-    print(f"✅ Loaded {len(samples)} test samples")
-    return samples
 
 
 def prepare_train_data(dataset_choice, test_samples):
@@ -270,19 +281,13 @@ def main():
     parser = argparse.ArgumentParser(description="Prepare math RL training/test data")
     parser.add_argument("--train", type=str, choices=["simplerl", "dapo", "openr1"],
                         help="Training dataset to prepare")
-    parser.add_argument("--force-test", action="store_true",
-                        help="Force regenerate test data even if file exists")
     parser.add_argument("--tiny", action="store_true",
                         help="Generate a tiny 128-sample validation set")
+    parser.add_argument("--no-separate", action="store_true",
+                        help="Don't save separate files per data source")
     args = parser.parse_args()
     
-    # Smart default: load existing test data if available, generate if not
-    test_file_exists = os.path.exists(TEST_DATA_FILE)
-    
-    if args.force_test or not test_file_exists:
-        test_samples = prepare_test_data()
-    else:
-        test_samples = load_existing_test_data()
+    test_samples = prepare_test_data(save_separate=not args.no_separate)
     
     if args.tiny:
         prepare_tiny_validation(test_samples)

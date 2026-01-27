@@ -57,12 +57,13 @@ import argparse
 import importlib.util
 import json
 import logging
+import math
 import os
 import re
 import glob
 import shutil
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 
 # Silence tokenizers parallelism warning (Ray uses forking)
@@ -91,7 +92,7 @@ DEFAULT_GCS_BUCKET = "gogo-verl-checkpoints"
 DEFAULT_GCS_CREDENTIALS = "/wx-gcs-key.json"
 DEFAULT_WANDB_KEY_FILE = "/workspace/wx-wandb-api-key.txt"
 
-DEFAULT_N_SAMPLES = 8
+DEFAULT_N_SAMPLES = 4
 DEFAULT_MAX_RESPONSE_LENGTH = 8192
 DEFAULT_MAX_PROMPT_LENGTH = 2048
 DEFAULT_TP_SIZE = 1  # TP=1 is optimal for small models, use parallel workers instead
@@ -100,7 +101,8 @@ DEFAULT_GPU_UTIL = 0.95
 DEFAULT_DTYPE = "auto"
 DEFAULT_WANDB_PROJECT = "verl_eval"
 DEFAULT_REWARD_FN = os.path.join(os.path.dirname(__file__), "reward.py")
-DEFAULT_DATA = "/workspace/data/math500.parquet,/workspace/data/aime24.parquet,/workspace/data/aime25.parquet,/workspace/data/amc23.parquet,/workspace/data/olympiad_bench.parquet,/workspace/data/minerva.parquet"
+# DEFAULT_DATA = "/workspace/data/math500.parquet,/workspace/data/aime24.parquet,/workspace/data/aime25.parquet,/workspace/data/amc23.parquet,/workspace/data/olympiad_bench.parquet,/workspace/data/minerva.parquet"
+DEFAULT_DATA = "/workspace/data/aime24.parquet,/workspace/data/aime25.parquet,/workspace/data/amc23.parquet"
 
 # Set GCS credentials if available
 if os.path.exists(DEFAULT_GCS_CREDENTIALS):
@@ -258,6 +260,17 @@ def load_reward_function(reward_path: str):
     spec.loader.exec_module(module)
     return module.compute_score
 
+def pass_at_k(n, c, k):
+    """
+    Calculate unbiased pass@k estimator.
+    n: total samples
+    c: correct samples  
+    k: k in pass@k
+    """
+    if n - c < k:
+        return 1.0
+    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
+
 def infer_step(model_path: str) -> int:
     """Infer step from path like .../global_step_100/..."""
     match = re.search(r'global_step_(\d+)', model_path)
@@ -304,16 +317,14 @@ class EvalWorker:
         self,
         model_path: str,
         data_path: str,
-        output_dir: str,
         step: int,
         n_samples: int,
         max_response_length: int,
         max_prompt_length: int,
         reward_path: str,
-        stats_only: bool,
         data_name: str = None,
     ):
-        """Run evaluation on a single checkpoint and data file."""
+        """Run evaluation on a single checkpoint and data file. Returns (step, data_name, df_results, summary)."""
         
         eval_start = time.time()
         
@@ -337,7 +348,7 @@ class EvalWorker:
             formatted.append(text)
         
         # Generate
-        log.info(f"Generating {len(formatted)} × {n_samples} responses...")
+        log.info(f"Generating {len(formatted)} × {n_samples} responses on {data_name}...")
         gen_start = time.time()
         params = SamplingParams(
             temperature=1.0,
@@ -346,10 +357,10 @@ class EvalWorker:
             n=n_samples,
         )
         outputs = self.llm.generate(formatted, params)
-        log.info(f"Generation took {time.time() - gen_start:.2f}s")
+        log.info(f"Generation of {len(formatted)} × {n_samples} responses on {data_name} took {time.time() - gen_start:.2f}s")
         
         # Score
-        log.info("Scoring responses...")
+        log.info(f"Scoring {len(outputs)} responses on {data_name}...")
         score_start = time.time()
         compute_score = load_reward_function(reward_path)
         
@@ -375,59 +386,37 @@ class EvalWorker:
                     "data_source": data_source,
                 })
         
-        log.info(f"Scoring took {time.time() - score_start:.2f}s")
+        log.info(f"Scoring {len(outputs)} responses on {data_name} took {time.time() - score_start:.2f}s")
         
-        # Compute metrics
+        # Compute metrics for this data file
         df_results = pd.DataFrame(results)
         
-        # Overall metrics
+        # Metrics keyed by data_name (the file being evaluated)
         summary = {}
-        summary["eval/overall/mean"] = df_results["score"].mean()
+        summary[f"eval/{data_name}/mean"] = df_results["score"].mean()
         
-        # Per-source metrics
-        for source in df_results["data_source"].unique():
-            mask = df_results["data_source"] == source
-            summary[f"eval/{source}/mean"] = df_results.loc[mask, "score"].mean()
-        
-        # Pass@k metrics
+        # Pass@k metrics (unbiased estimator)
         grouped = df_results.groupby("prompt_idx")["score"]
-        for k in [2, 4, 8]:
-            if k <= n_samples:
-                def pass_at_k(scores, k=k):
-                    n = len(scores)
-                    c = sum(scores)
-                    if n - c < k:
-                        return 1.0
-                    return 1.0 - (
-                        (1.0 - c/n) * 
-                        (1.0 - (c)/(n-1) if n > 1 else 0) *
-                        (1.0 - (c)/(n-2) if n > 2 else 0)
-                    )[:k].prod() if k <= 3 else 1.0 - sum(1 for s in scores if s == 0) / len(scores)
-                # Simplified pass@k
-                pass_k = grouped.apply(lambda x: 1.0 if x.max() > 0 else 0.0).mean()
-                summary[f"eval/overall/pass@{k}"] = pass_k
+        # k_values: powers of 2 up to n_samples (2, 4, 8, 16, ...)
+        k_values = [2**i for i in range(1, 10) if 2**i <= n_samples]
         
-        # Best@N
-        summary["eval/overall/best@N"] = grouped.max().mean()
+        for k in k_values:
+            # For each prompt: n=total samples, c=correct samples
+            pass_k_scores = []
+            for prompt_idx, scores in grouped:
+                n = len(scores)
+                c = int(scores.sum())
+                pass_k_scores.append(pass_at_k(n, c, k))
+            summary[f"eval/{data_name}/pass@{k}"] = np.mean(pass_k_scores)
         
-        # Save results (include data_name in filename if provided)
-        os.makedirs(output_dir, exist_ok=True)
-        suffix = f"_{data_name}" if data_name else ""
-        summary_path = os.path.join(output_dir, f"eval_step_{step}{suffix}_summary.json")
-        with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
-        log.info(f"Saved summary to {summary_path}")
-        
-        if not stats_only:
-            parquet_path = os.path.join(output_dir, f"eval_step_{step}{suffix}.parquet")
-            df_results.to_parquet(parquet_path)
-            log.info(f"Saved rollouts to {parquet_path}")
+        # Best@N (max score per prompt, averaged)
+        summary[f"eval/{data_name}/best@N"] = grouped.max().mean()
         
         total_time = time.time() - eval_start
-        data_info = f" on {data_name}" if data_name else ""
-        log.info(f"Step {step}{data_info} completed in {total_time:.2f}s. Mean score: {summary['eval/overall/mean']:.4f}")
+        log.info(f"Step {step} on {data_name} completed in {total_time:.2f}s. Mean: {summary[f'eval/{data_name}/mean']:.4f}")
         
-        return step, data_name, summary
+        # Return results for aggregation (don't write files here)
+        return step, data_name, df_results, summary
 
 
 # ============ Main ============
@@ -529,24 +518,21 @@ def main(args):
         except ValueError:
             log.warning(f"Invalid --resume value: {args.resume}")
     
-    # Build pending tasks: (step, ckpt_path, data_file)
+    # Build pending tasks: (step, ckpt_path, data_files_list)
     # Group by checkpoint so same model evaluates all data files
     pending = []
-    for step, ckpt_path in checkpoints:
+    for step, ckpt_path in checkpoints: # order of pending tasks is ordered since checkpoints are sorted
         if resume_from_step is not None and step < resume_from_step:
             continue
         
+        # Skip if combined summary already exists (not per-dataset, since we aggregate)
+        summary_file = os.path.join(args.output, f"eval_step_{step}_summary.json")
+        if resume_from_step is None and os.path.exists(summary_file):
+            log.info(f"Step {step} already evaluated, skipping")
+            continue
+        
+        # Add all data files for this checkpoint
         for data_file in data_files:
-            data_name = get_data_name(data_file)
-            # Include data name in output file if multiple data files
-            if len(data_files) > 1:
-                summary_file = os.path.join(args.output, f"eval_step_{step}_{data_name}_summary.json")
-            else:
-                summary_file = os.path.join(args.output, f"eval_step_{step}_summary.json")
-            
-            if resume_from_step is None and os.path.exists(summary_file):
-                log.info(f"Step {step} / {data_name} already evaluated, skipping")
-                continue
             pending.append((step, ckpt_path, data_file))
     
     if not pending:
@@ -576,17 +562,19 @@ def main(args):
     
     loop_start = time.time()
     
-    # Track: checkpoint -> (local_path, remaining_task_count, is_downloaded)
+    # Track: checkpoint -> (local_path, remaining_task_count, is_downloaded, worker_idx)
     ckpt_info = {}
     # Track: future -> (step, checkpoint_key)
     future_to_ckpt = {}
+    # Track: step -> list of (data_name, df_results, summary) for aggregation
+    step_results = defaultdict(list)
     
     # Submit tasks, downloading checkpoints as needed (limit to num_workers at a time)
     pending_futures = []
     all_results = []
-    ckpt_queue = list(tasks_by_ckpt.items())
-    ckpt_idx = 0
-    worker_available = list(range(num_workers))
+    # Sort by step to ensure deterministic order, use deque for efficient popleft
+    ckpt_queue = deque(sorted(tasks_by_ckpt.items(), key=lambda x: x[0][0]))
+    worker_available = deque(range(num_workers))
     
     def download_and_submit_ckpt(ckpt_key, data_files_for_ckpt, worker_idx):
         """Download checkpoint and submit all its tasks."""
@@ -601,28 +589,27 @@ def main(args):
             # For local paths, find the directory with config.json
             local_path = find_model_dir(ckpt_path)
         
-        # Track checkpoint info for cleanup
+        # Track checkpoint info for cleanup and worker assignment
         ckpt_info[ckpt_key] = {
             'local_path': local_path,
             'remaining': len(data_files_for_ckpt),
             'is_downloaded': is_downloaded,
+            'worker_idx': worker_idx,
         }
         
         # Submit tasks
         worker = workers[worker_idx]
         futures = []
         for data_file in data_files_for_ckpt:
-            data_name = get_data_name(data_file) if len(data_files) > 1 else None
+            data_name = get_data_name(data_file)
             future = worker.evaluate.remote(
                 local_path,
                 data_file,
-                args.output,
                 step,
                 args.n_samples,
                 args.max_response_length,
                 args.max_prompt_length,
                 args.reward,
-                args.stats_only,
                 data_name,
             )
             futures.append(future)
@@ -637,24 +624,26 @@ def main(args):
         
         path = info['local_path']
         try:
-            # Get parent directory to clean up entire global_step_X/
-            parent = os.path.dirname(path.rstrip('/'))
-            if 'global_step_' in parent:
-                shutil.rmtree(parent)
-                log.info(f"Cleaned up: {parent}")
+            # Find the global_step_X directory to delete entirely
+            target = path
+            while target and not os.path.basename(target).startswith('global_step_'):
+                target = os.path.dirname(target)
+            if target and os.path.basename(target).startswith('global_step_'):
+                shutil.rmtree(target)
+                log.info(f"Cleaned up: {target}")
             else:
+                # Fallback: just delete path
                 shutil.rmtree(path)
                 log.info(f"Cleaned up: {path}")
         except Exception as e:
             log.warning(f"Failed to cleanup {path}: {e}")
     
     # Initial submission: up to num_workers checkpoints
-    while ckpt_idx < len(ckpt_queue) and len(worker_available) > 0:
-        ckpt_key, data_files_for_ckpt = ckpt_queue[ckpt_idx]
-        worker_idx = worker_available.pop(0)
+    while ckpt_queue and worker_available:
+        ckpt_key, data_files_for_ckpt = ckpt_queue.popleft()
+        worker_idx = worker_available.popleft()
         futures = download_and_submit_ckpt(ckpt_key, data_files_for_ckpt, worker_idx)
         pending_futures.extend(futures)
-        ckpt_idx += 1
     
     # Process results as they complete (no sync barrier!)
     while pending_futures:
@@ -662,30 +651,77 @@ def main(args):
         done, pending_futures = ray.wait(pending_futures, num_returns=1)
         
         for future in done:
-            result = ray.get(future)
-            all_results.append(result)
+            step, data_name, df_results, summary = ray.get(future)
+            
+            # Store results for this step
+            step_results[step].append((data_name, df_results, summary))
             
             # Get checkpoint info
             ckpt_key = future_to_ckpt.pop(future)
-            step, _ = ckpt_key
             info = ckpt_info[ckpt_key]
             info['remaining'] -= 1
             
-            log.info(f"Step {step} task completed ({info['remaining']} remaining for this checkpoint)")
+            log.info(f"Step {step} / {data_name} completed,  ({info['remaining']} datasets remaining for this checkpoint)")
             
-            # If all tasks for this checkpoint done, clean up and submit next
+            # If all tasks for this checkpoint done, write combined files and clean up
             if info['remaining'] == 0:
+                # Aggregate and write combined results for this step
+                step_data = step_results[step]
+                
+                # Combine all DataFrames
+                all_dfs = [df for _, df, _ in step_data]
+                combined_df = pd.concat(all_dfs, ignore_index=True)
+                
+                # Combine all summaries + compute overall metrics
+                combined_summary = {}
+                all_scores = []
+                for data_name, df, summary in step_data:
+                    combined_summary.update(summary)
+                    all_scores.extend(df["score"].tolist())
+                
+                # Add overall metrics (across all datasets)
+                combined_summary["eval/overall/mean"] = np.mean(all_scores)
+                
+                # Overall pass@k (unbiased estimator, computed per prompt across all datasets)
+                grouped = combined_df.groupby(["data_source", "prompt_idx"])["score"]
+                k_values = [2**i for i in range(1, 10) if 2**i <= args.n_samples]
+                for k in k_values:
+                    pass_k_scores = []
+                    for _, scores in grouped:
+                        n = len(scores)
+                        c = int(scores.sum())
+                        pass_k_scores.append(pass_at_k(n, c, k))
+                    combined_summary[f"eval/overall/pass@{k}"] = np.mean(pass_k_scores)
+                
+                # Overall best@N
+                combined_summary["eval/overall/best@N"] = grouped.max().mean()
+                
+                # Write combined files
+                os.makedirs(args.output, exist_ok=True)
+                summary_path = os.path.join(args.output, f"eval_step_{step}_summary.json")
+                with open(summary_path, "w") as f:
+                    json.dump(combined_summary, f, indent=2)
+                log.info(f"Saved combined summary to {summary_path}")
+                
+                if not args.stats_only:
+                    parquet_path = os.path.join(args.output, f"eval_step_{step}.parquet")
+                    combined_df.to_parquet(parquet_path)
+                    log.info(f"Saved combined rollouts to {parquet_path}")
+                
+                # Store for TB/WandB logging
+                all_results.append((step, combined_summary))
+                
+                # Get the worker that just finished this checkpoint
+                finished_worker_idx = info['worker_idx']
+                
+                # Cleanup checkpoint
                 cleanup_ckpt(ckpt_key)
                 
-                # Find which worker was handling this checkpoint and submit next
-                # (worker assignment is implicit - any free worker will pick up)
-                if ckpt_idx < len(ckpt_queue):
-                    next_ckpt_key, next_data_files = ckpt_queue[ckpt_idx]
-                    # Use any worker (Ray will schedule appropriately)
-                    worker_idx = ckpt_idx % num_workers
-                    new_futures = download_and_submit_ckpt(next_ckpt_key, next_data_files, worker_idx)
+                # Submit next checkpoint to the worker that just finished
+                if ckpt_queue:
+                    next_ckpt_key, next_data_files = ckpt_queue.popleft()
+                    new_futures = download_and_submit_ckpt(next_ckpt_key, next_data_files, finished_worker_idx)
                     pending_futures = list(pending_futures) + new_futures
-                    ckpt_idx += 1
     
     results = all_results
     
@@ -693,29 +729,24 @@ def main(args):
     if args.tensorboard_dir and args.tensorboard_dir != "none":
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(log_dir=args.tensorboard_dir)
-        for step, data_name, summary in results:
+        for step, summary in results:
             for k, v in summary.items():
-                # Include data_name in metric key if present
-                key = f"{k}/{data_name}" if data_name else k
-                writer.add_scalar(key, v, global_step=step)
+                writer.add_scalar(k, v, global_step=step)
         writer.close()
         log.info(f"Logged to TensorBoard: {args.tensorboard_dir}")
     
     if args.wandb_project and args.wandb_project != "none" and WANDB_AVAILABLE:
         run_name = args.wandb_run or f"eval-{exp_name}"
         wandb.init(project=args.wandb_project, name=run_name, resume="allow")
-        for step, data_name, summary in results:
-            # Include data_name in metric key if present
-            log_data = {(f"{k}/{data_name}" if data_name else k): v for k, v in summary.items()}
-            wandb.log(log_data, step=step)
+        for step, summary in results:
+            wandb.log(summary, step=step)
         wandb.finish()
         log.info(f"Logged to WandB: {args.wandb_project}/{run_name}")
     
     # Summary
-    log.info(f"\nAll {len(results)} evaluations completed. Total time: {time.time() - loop_start:.2f}s")
-    for step, data_name, summary in sorted(results, key=lambda x: (x[0], x[1] or "")):
-        data_info = f" ({data_name})" if data_name else ""
-        log.info(f"  Step {step}{data_info}: {summary.get('eval/overall/mean', 0):.4f}")
+    log.info(f"\nAll {len(results)} steps evaluated. Total time: {time.time() - loop_start:.2f}s")
+    for step, summary in sorted(results, key=lambda x: x[0]):
+        log.info(f"  Step {step}: overall mean = {summary.get('eval/overall/mean', 0):.4f}")
     
     ray.shutdown()
 

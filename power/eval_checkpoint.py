@@ -67,6 +67,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import defaultdict
 
 # Silence tokenizers parallelism warning (subprocess workers use forking)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -89,7 +90,7 @@ DEFAULT_GCS_BUCKET = "gogo-verl-checkpoints"
 DEFAULT_GCS_CREDENTIALS = "/wx-gcs-key.json"
 DEFAULT_WANDB_KEY_FILE = "/workspace/wx-wandb-api-key.txt"
 
-DEFAULT_N_SAMPLES = 8
+DEFAULT_N_SAMPLES = 4
 DEFAULT_MAX_RESPONSE_LENGTH = 8192
 DEFAULT_MAX_PROMPT_LENGTH = 2048
 DEFAULT_TP_SIZE = 1  # TP=1 is optimal for small models, use parallel workers instead
@@ -98,7 +99,8 @@ DEFAULT_GPU_UTIL = 0.95
 DEFAULT_DTYPE = "auto"
 DEFAULT_WANDB_PROJECT = "verl_eval"
 DEFAULT_REWARD_FN = os.path.join(os.path.dirname(__file__), "reward.py")
-DEFAULT_DATA = "/workspace/data/math500.parquet,/workspace/data/aime24.parquet,/workspace/data/aime25.parquet,/workspace/data/amc23.parquet,/workspace/data/olympiad_bench.parquet,/workspace/data/minerva.parquet"
+# DEFAULT_DATA = "/workspace/data/math500.parquet,/workspace/data/aime24.parquet,/workspace/data/aime25.parquet,/workspace/data/amc23.parquet,/workspace/data/olympiad_bench.parquet,/workspace/data/minerva.parquet"
+DEFAULT_DATA = "/workspace/data/aime24.parquet,/workspace/data/aime25.parquet,/workspace/data/amc23.parquet"
 
 
 # Set GCS credentials if available
@@ -471,8 +473,25 @@ def log_metrics(summary, step, args, exp_name=None):
 
 # =====================================================
 
-def evaluate_model(model_path, output_file, args, exp_name=None):
-    """Run evaluation for a single model."""
+def evaluate_single_data(llm, data_path, args, compute_score):
+    """Evaluate model on a single data file (model already loaded). Returns results in memory."""
+    prompts, ground_truths, data_sources = load_eval_data(data_path)
+    outputs = generate_responses(llm, prompts, args)
+    results, summary = score_responses(outputs, ground_truths, data_sources, compute_score, args.n_samples)
+    log.info(f"Results for {data_path}:\n{json.dumps(summary, indent=2)}")
+    return results, summary
+
+def evaluate_model(model_path, data_files, output_dir, args, exp_name=None):
+    """
+    Evaluate model on multiple data files (loads model ONCE).
+    
+    Args:
+        model_path: Path to model (local or GCS)
+        data_files: List of data file paths
+        output_dir: Output directory for results
+        args: Arguments
+        exp_name: Experiment name for logging
+    """
     eval_start = time.time()
     
     # Download from GCS if needed
@@ -484,10 +503,9 @@ def evaluate_model(model_path, output_file, args, exp_name=None):
         model_path = downloaded_path
         log.info(f"Download completed in {time.time() - start:.2f}s")
     
-    # Load data and reward function
+    # Load reward function
     compute_score = load_reward_fn(args.reward)
     log.info(f"Using reward function: {args.reward}")
-    prompts, ground_truths, data_sources = load_eval_data(args.data)
     
     # Load model - find correct directory with config.json
     model_dir = find_model_dir(model_path)
@@ -505,16 +523,67 @@ def evaluate_model(model_path, output_file, args, exp_name=None):
     )
     log.info(f"Model loaded in {time.time() - start:.2f}s")
     
-    # Generate and score
-    outputs = generate_responses(llm, prompts, args)
-    results, summary = score_responses(outputs, ground_truths, data_sources, compute_score, args.n_samples)
+    # Evaluate each data file (model stays in memory!)
+    step = args.step
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Print summary
-    log.info(f"Results Summary:\n{json.dumps(summary, indent=2)}")
+    # Accumulate results in memory
+    all_results = []
+    all_scores = []
+    combined_summary = {}
     
-    # Save and log
-    save_results(results, summary, output_file, save_rollouts=not args.stats_only)
-    log_metrics(summary, args.step, args, exp_name)
+    for data_path in data_files:
+        data_name = get_data_name(data_path)
+        log.info(f"Evaluating {data_name}...")
+        results, summary = evaluate_single_data(llm, data_path, args, compute_score)
+        
+        # Add data_name to each result for combined parquet
+        for r in results:
+            r['data_file'] = data_name
+        all_results.extend(results)
+        
+        # Collect scores for overall metrics
+        for r in results:
+            if 'scores' in r and r['scores']:
+                all_scores.extend(r['scores'])
+        
+        # Rename summary keys: eval/overall/* -> eval/{data_name}/*
+        for k, v in summary.items():
+            if k.startswith("eval/overall/"):
+                new_key = k.replace("eval/overall/", f"eval/{data_name}/")
+                combined_summary[new_key] = v
+    
+    # Compute overall metrics across all data files
+    if all_scores:
+        combined_summary["eval/overall/mean"] = np.mean(all_scores)
+        combined_summary["eval/overall/mean_std"] = np.std(all_scores)
+    
+    # Compute overall pass@k
+    k_values = [2**i for i in range(1, 10) if 2**i <= args.n_samples]
+    for k in k_values:
+        pass_k_scores = []
+        for r in all_results:
+            if 'scores' in r and r['scores']:
+                scores = r['scores']
+                n = len(scores)
+                c = sum(1 for s in scores if s >= 1.0)
+                pass_k_scores.append(pass_at_k(n, c, k))
+        if pass_k_scores:
+            combined_summary[f"eval/overall/pass@{k}"] = np.mean(pass_k_scores)
+    
+    # Write combined output files directly (no intermediate files!)
+    summary_file = os.path.join(output_dir, f"eval_step_{step}_summary.json")
+    with open(summary_file, 'w') as f:
+        json.dump(combined_summary, f, indent=2)
+    log.info(f"Saved combined summary: {summary_file}")
+    
+    if not args.stats_only:
+        parquet_file = os.path.join(output_dir, f"eval_step_{step}.parquet")
+        pd.DataFrame(all_results).to_parquet(parquet_file)
+        log.info(f"Saved combined rollouts: {parquet_file}")
+    
+    # Log to TB/WandB
+    log_metrics(combined_summary, step, args, exp_name)
     
     # Cleanup
     if downloaded_path and not args.keep_downloads:
@@ -528,214 +597,259 @@ def get_data_name(data_path: str) -> str:
     return os.path.basename(data_path).replace(".parquet", "")
 
 
-def main(args):
-    # --- Path Resolution & Defaults ---
+# ================= Parallel Evaluation (Manager Mode) =================
+
+def filter_checkpoints(checkpoints, output_dir, resume):
+    """Filter checkpoints based on resume logic. Returns (pending, skipped_early, skipped_exists)."""
+    resume_from_step = None
+    if resume != "auto":
+        try:
+            resume_from_step = int(resume)
+            log.info(f"Starting from step >= {resume_from_step}")
+        except ValueError:
+            log.warning(f"Invalid --resume value: {resume}. Using auto.")
     
-    # Parse data files (comma-separated)
-    data_files = [f.strip() for f in args.data.split(",")]
-    log.info(f"Data files: {data_files}")
+    pending = []
+    skipped_early = 0
+    skipped_exists = 0
     
-    # 0. Resolve model path (handle gcs: shorthand)
+    for step, ckpt_path in checkpoints:
+        if resume_from_step is not None and step < resume_from_step:
+            skipped_early += 1
+            continue
+        
+        summary_file = os.path.join(output_dir, f"eval_step_{step}_summary.json")
+        if resume_from_step is None and os.path.exists(summary_file):
+            skipped_exists += 1
+            continue
+        
+        pending.append((step, ckpt_path))
+    
+    return pending, skipped_early, skipped_exists, resume_from_step
+
+
+def cleanup_checkpoint(local_path, is_downloaded, keep_downloads):
+    """Clean up downloaded checkpoint."""
+    if not is_downloaded or keep_downloads:
+        return
+    try:
+        # Find the global_step_X directory to delete entirely
+        target = local_path
+        while target and not os.path.basename(target).startswith('global_step_'):
+            target = os.path.dirname(target)
+        if target and os.path.basename(target).startswith('global_step_'):
+            shutil.rmtree(target)
+            log.info(f"[Manager] Cleaned up: {target}")
+        else:
+            # Fallback: just delete local_path
+            shutil.rmtree(local_path)
+            log.info(f"[Manager] Cleaned up: {local_path}")
+    except Exception as e:
+        log.warning(f"Failed to cleanup {local_path}: {e}")
+
+
+def log_all_summaries(summaries, tensorboard_dir, wandb_project, wandb_run, exp_name):
+    """Log all aggregated summaries to TensorBoard and WandB."""
+    if not summaries:
+        return
+    
+    if tensorboard_dir and tensorboard_dir != "none":
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=tensorboard_dir)
+        for step, summary in sorted(summaries.items()):
+            for k, v in summary.items():
+                writer.add_scalar(k, v, global_step=step)
+        writer.close()
+        log.info(f"Logged {len(summaries)} steps to TensorBoard: {tensorboard_dir}")
+    
+    if wandb_project and wandb_project != "none" and WANDB_AVAILABLE:
+        import wandb
+        run_name = wandb_run or f"eval-{exp_name}"
+        wandb.init(project=wandb_project, name=run_name, id=run_name, resume="allow")
+        for step, summary in sorted(summaries.items()):
+            wandb.log(summary, step=step)
+        wandb.finish()
+        log.info(f"Logged {len(summaries)} steps to WandB: {wandb_project}/{run_name}")
+
+
+def run_parallel_eval(pending, args, exp_name, data_files):
+    """Run parallel evaluation across multiple GPUs."""
+    total_gpus = args.num_gpus or DEFAULT_PARALLEL
+    num_workers = max(1, total_gpus // args.tensor_parallel_size)
+    
+    log.info(f"Evaluating {len(pending)} checkpoints (each with {len(data_files)} data files)...")
+    log.info(f"Using {num_workers} parallel workers (TP={args.tensor_parallel_size})")
+    
+    workers = {}  # worker_id -> (process, step, local_path, is_downloaded)
+    pending_iter = iter(pending)
+    completed = 0
+    summaries = {}
+    
+    def start_worker(worker_id, step, ckpt_path):
+        """Start subprocess on assigned GPU(s)."""
+        is_downloaded = False
+        if is_gcs_path(ckpt_path):
+            log.info(f"[Manager] Downloading checkpoint for step {step}...")
+            local_path = download_gcs_checkpoint(ckpt_path, exp_name=exp_name)
+            is_downloaded = True
+        else:
+            local_path = find_model_dir(ckpt_path)
+        
+        # Assign GPUs
+        if args.tensor_parallel_size == 1:
+            gpu_ids = str(worker_id)
+        else:
+            start_gpu = worker_id * args.tensor_parallel_size
+            gpu_ids = ",".join(str(start_gpu + i) for i in range(args.tensor_parallel_size))
+        
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu_ids
+        
+        cmd = [
+            sys.executable, __file__,
+            "--model", local_path,
+            "--data", args.data,
+            "--output", args.output,
+            "--n_samples", str(args.n_samples),
+            "--max_response_length", str(args.max_response_length),
+            "--max_prompt_length", str(args.max_prompt_length),
+            "--tensor_parallel_size", str(args.tensor_parallel_size),
+            "--gpu_memory_utilization", str(args.gpu_memory_utilization),
+            "--dtype", args.dtype,
+            "--step", str(step),
+            "--reward", args.reward,
+            "--force-single",
+            "--exp_name", exp_name,
+            "--tensorboard_dir", "none",
+            "--wandb_project", "none",
+            "--keep_downloads",
+        ]
+        if args.stats_only:
+            cmd.append("--stats_only")
+        
+        log.info(f"[Worker {worker_id}, GPU {gpu_ids}] Starting step {step}")
+        proc = subprocess.Popen(cmd, env=env)
+        return proc, local_path, is_downloaded
+    
+    # Initial launch
+    for worker_id in range(num_workers):
+        try:
+            step, ckpt_path = next(pending_iter)
+            proc, local_path, is_downloaded = start_worker(worker_id, step, ckpt_path)
+            workers[worker_id] = (proc, step, local_path, is_downloaded)
+        except StopIteration:
+            break
+    
+    # Poll until all done
+    while workers:
+        time.sleep(1)
+        for worker_id in list(workers.keys()):
+            proc, step, local_path, is_downloaded = workers[worker_id]
+            ret = proc.poll()
+            if ret is None:
+                continue
+            
+            completed += 1
+            if ret == 0:
+                log.info(f"[Worker {worker_id}] Step {step} completed ({completed}/{len(pending)})")
+                summary_file = os.path.join(args.output, f"eval_step_{step}_summary.json")
+                if os.path.exists(summary_file):
+                    with open(summary_file) as f:
+                        summaries[step] = json.load(f)
+            else:
+                log.warning(f"[Worker {worker_id}] Step {step} failed (exit code {ret})")
+            
+            cleanup_checkpoint(local_path, is_downloaded, args.keep_downloads)
+            
+            # Start next task
+            try:
+                next_step, next_ckpt = next(pending_iter)
+                proc, local_path, is_downloaded = start_worker(worker_id, next_step, next_ckpt)
+                workers[worker_id] = (proc, next_step, local_path, is_downloaded)
+            except StopIteration:
+                del workers[worker_id]
+    
+    return summaries
+
+
+# ================= Main Entry Point =================
+
+def resolve_defaults(args):
+    """Resolve default values for args based on model path."""
+    # Handle gcs: shorthand
     if args.model.startswith("gcs:"):
-        # gcs:exp_name → gs://{DEFAULT_GCS_BUCKET}/exp_name
         args.model = f"gs://{DEFAULT_GCS_BUCKET}/{args.model[4:]}"
         log.info(f"Using GCS path: {args.model}")
     
-    # 1. Detect Iteration Mode
-    checkpoints = []
-    if not args.force_single:
-        checkpoints = find_checkpoints(args.model)
-    
-    # 2. Extract Experiment Name (for defaults)
-    # Handle both local and GCS paths
+    # Extract experiment name
     model_path_str = args.model.replace("gs://", "").rstrip('/')
     path_parts = model_path_str.split('/')
     exp_name = path_parts[-1]
-    # If pointing to a global_step_X subdir, go up one level
     if exp_name.startswith('global_step_'):
         exp_name = path_parts[-2] if len(path_parts) > 1 else exp_name
-
-    # 3. Resolve Output Directory
+    
+    # Output directory
     if args.output is None:
         args.output = f"./validation/{exp_name}"
-
-    # 4. Resolve Logging Defaults
+    
     # TensorBoard
     if args.tensorboard_dir is None:
-        # Auto-detect default
         args.tensorboard_dir = f"/workspace/tensorboard_logs/{exp_name}"
         log.info(f"Auto-detected TensorBoard dir: {args.tensorboard_dir}")
     elif args.tensorboard_dir == "none":
-        # Explicitly disabled
-        log.info("TensorBoard logging disabled by user.")
-        # Important: Don't set to None here, keep as "none" so subprocess knows to disable it
+        log.info("TensorBoard logging disabled.")
     
     # WandB
     if args.wandb_project is None:
-        if WANDB_AVAILABLE:
-            args.wandb_project = DEFAULT_WANDB_PROJECT
-        else:
-            args.wandb_project = "none"
+        args.wandb_project = DEFAULT_WANDB_PROJECT if WANDB_AVAILABLE else "none"
+        if not WANDB_AVAILABLE:
             log.info("WandB disabled: no API key found.")
     elif args.wandb_project == "none":
-        log.info("WandB logging disabled by user.")
-        # Important: Don't set to None here, keep as "none" so subprocess knows to disable it
+        log.info("WandB logging disabled.")
+    
+    return exp_name
 
-    # ----------------------------------
 
-    if len(checkpoints) > 0:
-        # MANAGER MODE: Parallel evaluation across GPUs
-        total_gpus = args.num_gpus if args.num_gpus else DEFAULT_PARALLEL
-        
-        # Calculate number of parallel workers (total_gpus / tp)
-        num_workers = max(1, total_gpus // args.tensor_parallel_size)
-        
-        # Parse --resume: auto | <step>
-        resume_from_step = None
-        if args.resume != "auto":
-            try:
-                resume_from_step = int(args.resume)
-                log.info(f"Starting from step >= {resume_from_step}")
-            except ValueError:
-                log.warning(f"Invalid --resume value: {args.resume}. Using auto.")
-        
-        log.info(f"Found {len(checkpoints)} checkpoints. Using {num_workers} parallel workers (TP={args.tensor_parallel_size})...")
+def main(args):
+    # Parse data files
+    data_files = [f.strip() for f in args.data.split(",")]
+    log.info(f"Data files: {data_files}")
+    
+    # Resolve defaults
+    exp_name = resolve_defaults(args)
+    
+    # Detect mode: manager (multiple checkpoints) or worker (single model)
+    checkpoints = [] if args.force_single else find_checkpoints(args.model)
+    
+    if checkpoints:
+        # MANAGER MODE
+        log.info(f"Found {len(checkpoints)} checkpoints")
         loop_start = time.time()
         
-        # Build list of (step, ckpt_path, data_file, out_file) to process
-        pending = []
-        skipped_early = 0
-        skipped_exists = 0
-        for step, ckpt_path in checkpoints:
-            # Skip if step < resume_from_step
-            if resume_from_step is not None and step < resume_from_step:
-                skipped_early += 1
-                continue
-            
-            for data_file in data_files:
-                os.makedirs(args.output, exist_ok=True)
-                data_name = get_data_name(data_file) if len(data_files) > 1 else None
-                suffix = f"_{data_name}" if data_name else ""
-                out_file = os.path.join(args.output, f"eval_step_{step}{suffix}.parquet")
-                summary_file = os.path.join(args.output, f"eval_step_{step}{suffix}_summary.json")
-                
-                # Skip if summary JSON exists (only in auto mode)
-                if resume_from_step is None and os.path.exists(summary_file):
-                    skipped_exists += 1
-                    continue
-                
-                pending.append((step, ckpt_path, data_file, out_file))
+        pending, skipped_early, skipped_exists, _ = filter_checkpoints(
+            checkpoints, args.output, args.resume
+        )
         
         if skipped_early > 0:
-            log.info(f"Skipped {skipped_early} checkpoints (step < {resume_from_step})")
+            log.info(f"Skipped {skipped_early} checkpoints (below resume step)")
         if skipped_exists > 0:
-            log.info(f"Skipped {skipped_exists} checkpoints (output exists)")
+            log.info(f"Skipped {skipped_exists} steps (output exists)")
         
-        if not pending:
-            log.info("All checkpoints already evaluated.")
+        if pending:
+            summaries = run_parallel_eval(pending, args, exp_name, data_files)
+            log_all_summaries(
+                summaries, args.tensorboard_dir, args.wandb_project, args.wandb_run, exp_name
+            )
         else:
-            log.info(f"Evaluating {len(pending)} tasks...")
-            
-            # Worker pool: {worker_id: (process, step, data_file)}
-            workers = {}
-            pending_iter = iter(pending)
-            completed = 0
-            
-            def start_worker(worker_id, step, ckpt_path, data_file, out_file):
-                """Start evaluation on specific GPU(s)."""
-                env = os.environ.copy()
-                # Assign GPU(s) based on TP size
-                if args.tensor_parallel_size == 1:
-                    gpu_ids = str(worker_id)
-                else:
-                    # For TP > 1, assign consecutive GPUs
-                    start_gpu = worker_id * args.tensor_parallel_size
-                    gpu_ids = ",".join(str(start_gpu + i) for i in range(args.tensor_parallel_size))
-                env["CUDA_VISIBLE_DEVICES"] = gpu_ids
-                
-                cmd = [
-                    sys.executable, __file__,
-                    "--model", ckpt_path,
-                    "--data", data_file,  # Single data file for this task
-                    "--output", out_file,
-                    "--n_samples", str(args.n_samples),
-                    "--max_response_length", str(args.max_response_length),
-                    "--max_prompt_length", str(args.max_prompt_length),
-                    "--tensor_parallel_size", str(args.tensor_parallel_size),
-                    "--gpu_memory_utilization", str(args.gpu_memory_utilization),
-                    "--dtype", args.dtype,
-                    "--step", str(step),
-                    "--reward", args.reward,
-                    "--force-single"
-                ]
-                if args.tensorboard_dir:
-                    cmd.extend(["--tensorboard_dir", args.tensorboard_dir])
-                if args.wandb_project:
-                    cmd.extend(["--wandb_project", args.wandb_project])
-                    if args.wandb_run:
-                        cmd.extend(["--wandb_run", args.wandb_run])
-                cmd.extend(["--exp_name", exp_name])
-                if args.stats_only:
-                    cmd.append("--stats_only")
-                if args.keep_downloads:
-                    cmd.append("--keep_downloads")
-                
-                data_name = get_data_name(data_file) if len(data_files) > 1 else ""
-                data_info = f" ({data_name})" if data_name else ""
-                log.info(f"[Worker {worker_id}, GPU {gpu_ids}] Starting step {step}{data_info}")
-                proc = subprocess.Popen(cmd, env=env)
-                return proc
-            
-            # Initial launch: fill all workers
-            for worker_id in range(num_workers):
-                try:
-                    step, ckpt_path, data_file, out_file = next(pending_iter)
-                    workers[worker_id] = (start_worker(worker_id, step, ckpt_path, data_file, out_file), step, data_file)
-                except StopIteration:
-                    break
-            
-            # Process until all done (no sync barriers!)
-            while workers:
-                time.sleep(1)  # Poll interval
-                for worker_id in list(workers.keys()):
-                    proc, step, data_file = workers[worker_id]
-                    ret = proc.poll()
-                    if ret is not None:  # Process finished
-                        completed += 1
-                        data_name = get_data_name(data_file) if len(data_files) > 1 else ""
-                        data_info = f" ({data_name})" if data_name else ""
-                        if ret == 0:
-                            log.info(f"[Worker {worker_id}] Step {step}{data_info} completed ({completed}/{len(pending)})")
-                        else:
-                            log.info(f"[Worker {worker_id}] Step {step}{data_info} failed with code {ret}")
-                        
-                        # Immediately start next task on this worker
-                        try:
-                            next_step, next_ckpt, next_data, next_out = next(pending_iter)
-                            workers[worker_id] = (start_worker(worker_id, next_step, next_ckpt, next_data, next_out), next_step, next_data)
-                        except StopIteration:
-                            del workers[worker_id]  # No more work, free this worker
+            log.info("All checkpoints already evaluated.")
         
-        log.info(f"All evaluations completed. Total time: {time.time() - loop_start:.2f}s")
-                
+        log.info(f"Total time: {time.time() - loop_start:.2f}s")
+    
     else:
-        # WORKER MODE: Evaluate single model
-        step = args.step if args.step is not None else infer_step(args.model)
-        # Update args.step for logging
-        args.step = step
-        
-        os.makedirs(args.output, exist_ok=True)
-        final_exp_name = args.exp_name if args.exp_name else exp_name
-        
-        # Iterate over data files (supports comma-separated list)
-        for data_file in data_files:
-            data_name = get_data_name(data_file) if len(data_files) > 1 else None
-            suffix = f"_{data_name}" if data_name else ""
-            out_file = os.path.join(args.output, f"eval_step_{step}{suffix}.parquet")
-            
-            # Set single file for evaluate_model
-            args.data = data_file
-            evaluate_model(args.model, out_file, args, exp_name=final_exp_name)
+        # WORKER MODE
+        args.step = args.step if args.step is not None else infer_step(args.model)
+        final_exp_name = args.exp_name or exp_name
+        evaluate_model(args.model, data_files, args.output, args, exp_name=final_exp_name)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

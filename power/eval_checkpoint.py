@@ -7,15 +7,22 @@ Supported model sources:
   - GCS shorthand:    gcs:exp_name (uses default bucket)
   - GCS explicit:     gs://bucket/exp_name
 
+Parallel GPU execution:
+  - For multiple checkpoints, runs one eval per GPU in parallel
+  - No sync barriers: as soon as a GPU finishes, it starts the next checkpoint
+  - Default: TP=1 (one model per GPU), use all available GPUs
+
 Arguments and defaults (Only --model is required. All others have defaults)
   --model             (REQUIRED) Model path, HF ID, or gcs:exp_name
-  --data              test.parquet
+  --data              /workspace/data/test.parquet (comma-separated for multiple)
   --output            ./validation/{exp_name}
   --n_samples         8
   --max_response_length 8192
   --max_prompt_length 2048
-  --tp                {GPU count} or 1
-  --gpu_util          0.95
+  --tensor_parallel_size  1 (TP size per eval)
+  --num_gpus          {all available} (for parallel workers)
+  --resume            auto | <step> (default: auto, e.g. --resume 500)
+  --gpu_memory_utilization  0.95
   --dtype             auto
   --step              0 (or inferred from global_step_X)
   --tensorboard_dir   /workspace/tensorboard_logs/{exp_name}
@@ -23,25 +30,27 @@ Arguments and defaults (Only --model is required. All others have defaults)
   --wandb_run         eval-{exp_name}
   --exp_name          auto-detected from model path
   --reward            verl/power/reward.py
-  --keep_downloads    False (delete GCS downloads after eval)
-  --force-single      False
+  --stats_only        only save summary JSON, skip rollouts parquet
+  --keep_downloads    keep downloaded GCS checkpoints after eval
+  --force-single      treat input as single model even if directory
+
+Output files:
+  eval_step_{N}_summary.json  - Aggregated metrics (always saved)
+  eval_step_{N}.parquet       - Detailed rollouts (default, skip with --stats_only)
 
 Examples:
 
   # Evaluate base model from HuggingFace
   python3 eval_checkpoint.py --model Qwen/Qwen2.5-0.5B-Instruct
   
-  # Evaluate local checkpoint
-  python3 eval_checkpoint.py --model /path/to/checkpoint --tp 4
+  # Evaluate all checkpoints (auto-parallel on all GPUs)
+  python3 eval_checkpoint.py --model gcs:GRPO-1.5B-exp
   
-  # Evaluate all checkpoints in local experiment dir
-  python3 eval_checkpoint.py --model /path/to/experiment_dir --tp 4
+  # Use 4 GPUs for parallel eval (4 checkpoints at once)
+  python3 eval_checkpoint.py --model /path/to/experiment_dir --num_gpus 4
   
-  # Evaluate from GCS (downloads to ./checkpoints/, deletes after)
-  python3 eval_checkpoint.py --model gcs:GRPO-1.5B-exp --tp 4
-  
-  # Keep downloaded checkpoints for inspection
-  python3 eval_checkpoint.py --model gcs:GRPO-1.5B-exp --keep_downloads
+  # Large model: use TP=4 on 4 GPUs (sequential, not parallel)
+  python3 eval_checkpoint.py --model gcs:GRPO-70B-exp --tensor_parallel_size 4 --num_gpus 1
   
   # Disable logging
   python3 eval_checkpoint.py --model gcs:exp --tensorboard_dir none --wandb_project none
@@ -80,7 +89,8 @@ DEFAULT_WANDB_KEY_FILE = "/workspace/wx-wandb-api-key.txt"
 DEFAULT_N_SAMPLES = 8
 DEFAULT_MAX_RESPONSE_LENGTH = 8192
 DEFAULT_MAX_PROMPT_LENGTH = 2048
-DEFAULT_TP_SIZE = torch.cuda.device_count() if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1
+DEFAULT_TP_SIZE = 1  # TP=1 is optimal for small models, use parallel workers instead
+DEFAULT_PARALLEL = torch.cuda.device_count() if torch.cuda.is_available() else 1
 DEFAULT_GPU_UTIL = 0.95
 DEFAULT_DTYPE = "auto"
 DEFAULT_WANDB_PROJECT = "verl_eval"
@@ -257,6 +267,24 @@ def infer_step(model_path):
         return int(match.group(1))
     return 0
 
+def find_model_dir(base_dir: str) -> str:
+    """Find the directory containing config.json for vLLM to load.
+    
+    verl structure: actor/huggingface/ contains config.json + weights
+    Standard HF: config.json is in the root
+    """
+    # Check if config.json exists directly
+    if os.path.exists(os.path.join(base_dir, "config.json")):
+        return base_dir
+    
+    # Check huggingface/ subdir (verl structure: actor/huggingface/)
+    hf_dir = os.path.join(base_dir, "huggingface")
+    if os.path.isdir(hf_dir) and os.path.exists(os.path.join(hf_dir, "config.json")):
+        return hf_dir
+    
+    # Fallback to base_dir (will likely fail, but let vLLM give the error)
+    return base_dir
+
 # ================= Evaluation Helpers =================
 
 def load_eval_data(data_path):
@@ -386,21 +414,23 @@ def score_responses(outputs, ground_truths, data_sources, compute_score, n_sampl
     log.info(f"Scoring finished in {time.time() - start_time:.2f}s")
     return results, summary
 
-def save_results(results, summary, output_file):
-    """Save results to parquet and summary to JSON."""
+def save_results(results, summary, output_file, save_rollouts=True):
+    """Save summary to JSON, optionally save detailed rollouts to parquet."""
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     
-    if not output_file.endswith('.parquet'):
-        output_file += '.parquet'
-        
-    df_results = pd.DataFrame(results)
-    df_results.to_parquet(output_file)
-    log.info(f"Saved detailed results to {output_file}")
-    
+    # Summary JSON is always saved (and serves as completion marker)
     summary_path = output_file.replace('.parquet', '_summary.json')
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
     log.info(f"Saved summary to {summary_path}")
+    
+    # Parquet with detailed rollouts is optional
+    if save_rollouts:
+        if not output_file.endswith('.parquet'):
+            output_file += '.parquet'
+        df_results = pd.DataFrame(results)
+        df_results.to_parquet(output_file)
+        log.info(f"Saved detailed rollouts to {output_file}")
     
     return output_file
 
@@ -442,14 +472,18 @@ def evaluate_model(model_path, output_file, args, exp_name=None):
     log.info(f"Using reward function: {args.reward}")
     prompts, ground_truths, data_sources = load_eval_data(args.data)
     
-    # Load model
-    log.info(f"Loading model {model_path}...")
+    # Load model - find correct directory with config.json
+    model_dir = find_model_dir(model_path)
+    if model_dir != model_path:
+        log.info(f"Found model config in: {model_dir}")
+    
+    log.info(f"Loading model {model_dir}...")
     start = time.time()
     llm = LLM(
-        model=model_path, 
-        tensor_parallel_size=args.tp, 
+        model=model_dir, 
+        tensor_parallel_size=args.tensor_parallel_size, 
         trust_remote_code=True,
-        gpu_memory_utilization=args.gpu_util,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         dtype=args.dtype
     )
     log.info(f"Model loaded in {time.time() - start:.2f}s")
@@ -462,7 +496,7 @@ def evaluate_model(model_path, output_file, args, exp_name=None):
     log.info(f"Results Summary:\n{json.dumps(summary, indent=2)}")
     
     # Save and log
-    save_results(results, summary, output_file)
+    save_results(results, summary, output_file, save_rollouts=not args.stats_only)
     log_metrics(summary, args.step, args, exp_name)
     
     # Cleanup
@@ -472,8 +506,17 @@ def evaluate_model(model_path, output_file, args, exp_name=None):
     
     log.info(f"Total evaluation time: {time.time() - eval_start:.2f}s")
 
+def get_data_name(data_path: str) -> str:
+    """Extract short name from data path for output files."""
+    return os.path.basename(data_path).replace(".parquet", "")
+
+
 def main(args):
     # --- Path Resolution & Defaults ---
+    
+    # Parse data files (comma-separated)
+    data_files = [f.strip() for f in args.data.split(",")]
+    log.info(f"Data files: {data_files}")
     
     # 0. Resolve model path (handle gcs: shorthand)
     if args.model.startswith("gcs:"):
@@ -524,65 +567,139 @@ def main(args):
     # ----------------------------------
 
     if len(checkpoints) > 0:
-        # MANAGER MODE: Iterate through checkpoints
-        log.info(f"Found {len(checkpoints)} checkpoints. Starting evaluation loop...")
-        loop_start = time.time()
-
-        for step, ckpt_path in checkpoints:
-            log.info(f"\n=== Processing Step {step} ===")
-            
-            # Construct output filename
-            if os.path.isdir(args.output) or not args.output.endswith(('.json', '.parquet')):
-                os.makedirs(args.output, exist_ok=True)
-                out_file = os.path.join(args.output, f"eval_step_{step}.parquet")
-            else:
-                # If user gave a file path but we have multiple checkpoints, append step
-                base, ext = os.path.splitext(args.output)
-                out_file = f"{base}_step_{step}{ext}"
-
-            if os.path.exists(out_file):
-                log.info(f"Output {out_file} exists. Skipping.")
-                continue
-
-            # Construct command to run self in worker mode
-            cmd = [
-                sys.executable, __file__,
-                "--model", ckpt_path,
-                "--data", args.data,
-                "--output", out_file,
-                "--n_samples", str(args.n_samples),
-                "--max_response_length", str(args.max_response_length),
-                "--max_prompt_length", str(args.max_prompt_length),
-                "--tp", str(args.tp),
-                "--gpu_util", str(args.gpu_util),
-                "--dtype", args.dtype,
-                "--step", str(step),
-                "--reward", args.reward,
-                "--force-single" # Important: prevent recursion
-            ]
-            
-            # Pass resolved logging args
-            if args.tensorboard_dir:
-                cmd.extend(["--tensorboard_dir", args.tensorboard_dir])
-            
-            if args.wandb_project:
-                cmd.extend(["--wandb_project", args.wandb_project])
-                if args.wandb_run:
-                    cmd.extend(["--wandb_run", args.wandb_run])
-            
-            # Pass exp_name so subprocess uses consistent WandB run name
-            cmd.extend(["--exp_name", exp_name])
-            
-            if args.keep_downloads:
-                cmd.append("--keep_downloads")
-
-            # Run subprocess
-            try:
-                subprocess.check_call(cmd)
-            except subprocess.CalledProcessError as e:
-                log.info(f"Error evaluating step {step}: {e}")
+        # MANAGER MODE: Parallel evaluation across GPUs
+        total_gpus = args.num_gpus if args.num_gpus else DEFAULT_PARALLEL
         
-        log.info(f"All checkpoints evaluated. Total loop time: {time.time() - loop_start:.2f}s")
+        # Calculate number of parallel workers (total_gpus / tp)
+        num_workers = max(1, total_gpus // args.tensor_parallel_size)
+        
+        # Parse --resume: auto | <step>
+        resume_from_step = None
+        if args.resume != "auto":
+            try:
+                resume_from_step = int(args.resume)
+                log.info(f"Starting from step >= {resume_from_step}")
+            except ValueError:
+                log.warning(f"Invalid --resume value: {args.resume}. Using auto.")
+        
+        log.info(f"Found {len(checkpoints)} checkpoints. Using {num_workers} parallel workers (TP={args.tensor_parallel_size})...")
+        loop_start = time.time()
+        
+        # Build list of (step, ckpt_path, data_file, out_file) to process
+        pending = []
+        skipped_early = 0
+        skipped_exists = 0
+        for step, ckpt_path in checkpoints:
+            # Skip if step < resume_from_step
+            if resume_from_step is not None and step < resume_from_step:
+                skipped_early += 1
+                continue
+            
+            for data_file in data_files:
+                os.makedirs(args.output, exist_ok=True)
+                data_name = get_data_name(data_file) if len(data_files) > 1 else None
+                suffix = f"_{data_name}" if data_name else ""
+                out_file = os.path.join(args.output, f"eval_step_{step}{suffix}.parquet")
+                summary_file = os.path.join(args.output, f"eval_step_{step}{suffix}_summary.json")
+                
+                # Skip if summary JSON exists (only in auto mode)
+                if resume_from_step is None and os.path.exists(summary_file):
+                    skipped_exists += 1
+                    continue
+                
+                pending.append((step, ckpt_path, data_file, out_file))
+        
+        if skipped_early > 0:
+            log.info(f"Skipped {skipped_early} checkpoints (step < {resume_from_step})")
+        if skipped_exists > 0:
+            log.info(f"Skipped {skipped_exists} checkpoints (output exists)")
+        
+        if not pending:
+            log.info("All checkpoints already evaluated.")
+        else:
+            log.info(f"Evaluating {len(pending)} tasks...")
+            
+            # Worker pool: {worker_id: (process, step, data_file)}
+            workers = {}
+            pending_iter = iter(pending)
+            completed = 0
+            
+            def start_worker(worker_id, step, ckpt_path, data_file, out_file):
+                """Start evaluation on specific GPU(s)."""
+                env = os.environ.copy()
+                # Assign GPU(s) based on TP size
+                if args.tensor_parallel_size == 1:
+                    gpu_ids = str(worker_id)
+                else:
+                    # For TP > 1, assign consecutive GPUs
+                    start_gpu = worker_id * args.tensor_parallel_size
+                    gpu_ids = ",".join(str(start_gpu + i) for i in range(args.tensor_parallel_size))
+                env["CUDA_VISIBLE_DEVICES"] = gpu_ids
+                
+                cmd = [
+                    sys.executable, __file__,
+                    "--model", ckpt_path,
+                    "--data", data_file,  # Single data file for this task
+                    "--output", out_file,
+                    "--n_samples", str(args.n_samples),
+                    "--max_response_length", str(args.max_response_length),
+                    "--max_prompt_length", str(args.max_prompt_length),
+                    "--tensor_parallel_size", str(args.tensor_parallel_size),
+                    "--gpu_memory_utilization", str(args.gpu_memory_utilization),
+                    "--dtype", args.dtype,
+                    "--step", str(step),
+                    "--reward", args.reward,
+                    "--force-single"
+                ]
+                if args.tensorboard_dir:
+                    cmd.extend(["--tensorboard_dir", args.tensorboard_dir])
+                if args.wandb_project:
+                    cmd.extend(["--wandb_project", args.wandb_project])
+                    if args.wandb_run:
+                        cmd.extend(["--wandb_run", args.wandb_run])
+                cmd.extend(["--exp_name", exp_name])
+                if args.stats_only:
+                    cmd.append("--stats_only")
+                if args.keep_downloads:
+                    cmd.append("--keep_downloads")
+                
+                data_name = get_data_name(data_file) if len(data_files) > 1 else ""
+                data_info = f" ({data_name})" if data_name else ""
+                log.info(f"[Worker {worker_id}, GPU {gpu_ids}] Starting step {step}{data_info}")
+                proc = subprocess.Popen(cmd, env=env)
+                return proc
+            
+            # Initial launch: fill all workers
+            for worker_id in range(num_workers):
+                try:
+                    step, ckpt_path, data_file, out_file = next(pending_iter)
+                    workers[worker_id] = (start_worker(worker_id, step, ckpt_path, data_file, out_file), step, data_file)
+                except StopIteration:
+                    break
+            
+            # Process until all done (no sync barriers!)
+            while workers:
+                time.sleep(1)  # Poll interval
+                for worker_id in list(workers.keys()):
+                    proc, step, data_file = workers[worker_id]
+                    ret = proc.poll()
+                    if ret is not None:  # Process finished
+                        completed += 1
+                        data_name = get_data_name(data_file) if len(data_files) > 1 else ""
+                        data_info = f" ({data_name})" if data_name else ""
+                        if ret == 0:
+                            log.info(f"[Worker {worker_id}] Step {step}{data_info} completed ({completed}/{len(pending)})")
+                        else:
+                            log.info(f"[Worker {worker_id}] Step {step}{data_info} failed with code {ret}")
+                        
+                        # Immediately start next task on this worker
+                        try:
+                            next_step, next_ckpt, next_data, next_out = next(pending_iter)
+                            workers[worker_id] = (start_worker(worker_id, next_step, next_ckpt, next_data, next_out), next_step, next_data)
+                        except StopIteration:
+                            del workers[worker_id]  # No more work, free this worker
+        
+        log.info(f"All evaluations completed. Total time: {time.time() - loop_start:.2f}s")
                 
     else:
         # WORKER MODE: Evaluate single model
@@ -590,29 +707,31 @@ def main(args):
         # Update args.step for logging
         args.step = step
         
-        # Determine output filename if it's a directory
-        if os.path.isdir(args.output) or not args.output.endswith(('.json', '.parquet')):
-             os.makedirs(args.output, exist_ok=True)
-             args.output = os.path.join(args.output, f"eval_step_{step}.parquet")
-        
-        # Ensure output ends with .parquet if it's a file path
-        elif not args.output.endswith('.parquet'):
-             args.output += '.parquet'
-
-        # Use provided exp_name (from manager) or extracted one
+        os.makedirs(args.output, exist_ok=True)
         final_exp_name = args.exp_name if args.exp_name else exp_name
-        evaluate_model(args.model, args.output, args, exp_name=final_exp_name)
+        
+        # Iterate over data files (supports comma-separated list)
+        for data_file in data_files:
+            data_name = get_data_name(data_file) if len(data_files) > 1 else None
+            suffix = f"_{data_name}" if data_name else ""
+            out_file = os.path.join(args.output, f"eval_step_{step}{suffix}.parquet")
+            
+            # Set single file for evaluate_model
+            args.data = data_file
+            evaluate_model(args.model, out_file, args, exp_name=final_exp_name)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True, help="Path to model checkpoint or directory of checkpoints")
-    parser.add_argument("--data", default=DEFAULT_DATA, help="Path to test.parquet")
+    parser.add_argument("--data", default=DEFAULT_DATA, help="Path(s) to test parquet (comma-separated for multiple)")
     parser.add_argument("--output", default=None, help="Path to output file/dir. Defaults to {model_dir}/val")
     parser.add_argument("--n_samples", type=int, default=DEFAULT_N_SAMPLES, help="Number of samples per prompt")
     parser.add_argument("--max_response_length", type=int, default=DEFAULT_MAX_RESPONSE_LENGTH)
     parser.add_argument("--max_prompt_length", type=int, default=DEFAULT_MAX_PROMPT_LENGTH)
-    parser.add_argument("--tp", type=int, default=DEFAULT_TP_SIZE)
-    parser.add_argument("--gpu_util", type=float, default=DEFAULT_GPU_UTIL)
+    parser.add_argument("--tensor_parallel_size", type=int, default=DEFAULT_TP_SIZE, help="Tensor parallel size (default: 1)")
+    parser.add_argument("--num_gpus", type=int, default=None, help="Number of GPUs for parallel eval (default: all available)")
+    parser.add_argument("--resume", type=str, default="auto", help="auto (skip if output exists) | <step> (redo from this step, overwrite)")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=DEFAULT_GPU_UTIL)
     parser.add_argument("--dtype", type=str, default=DEFAULT_DTYPE)
     parser.add_argument("--step", type=int, default=None, help="Training step for logging (override)")
     parser.add_argument("--tensorboard_dir", type=str, default=None, help="Path to TB logs. Set 'none' to disable.")
@@ -620,6 +739,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_run", type=str, default=None, help="WandB run name (default: eval-{exp_name})")
     parser.add_argument("--exp_name", type=str, default=None, help="Experiment name (auto-detected if not provided)")
     parser.add_argument("--reward", type=str, default=DEFAULT_REWARD_FN, help="Path to reward function file")
+    parser.add_argument("--stats_only", action="store_true", help="Only save summary JSON, skip rollouts parquet")
     parser.add_argument("--keep_downloads", action="store_true", help="Keep downloaded GCS checkpoints (default: delete after eval)")
     parser.add_argument("--force-single", action="store_true", help="Treat input as single model even if it looks like a dir")
     args = parser.parse_args()

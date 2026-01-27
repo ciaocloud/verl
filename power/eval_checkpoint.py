@@ -95,7 +95,7 @@ DEFAULT_GPU_UTIL = 0.95
 DEFAULT_DTYPE = "auto"
 DEFAULT_WANDB_PROJECT = "verl_eval"
 DEFAULT_REWARD_FN = os.path.join(os.path.dirname(__file__), "reward.py")
-DEFAULT_DATA = "/workspace/data/test.parquet"
+DEFAULT_DATA = "/workspace/data/math500.parquet,/workspace/data/aime24.parquet,/workspace/data/aime25.parquet,/workspace/data/amc23.parquet,/workspace/data/olympiad_bench.parquet,/workspace/data/minerva.parquet"
 
 
 # Set GCS credentials if available
@@ -179,10 +179,15 @@ def download_gcs_checkpoint(gcs_path, exp_name=None):
     ckpt_name = os.path.basename(prefix.rstrip('/'))
     local_ckpt_dir = os.path.join("./checkpoints", exp_name, ckpt_name)
     
-    # If already downloaded, reuse
+    # If already downloaded, reuse if valid
     if os.path.isdir(local_ckpt_dir) and os.listdir(local_ckpt_dir):
-        log.info(f"Using cached checkpoint: {local_ckpt_dir}")
-        return local_ckpt_dir
+        # Check if config.json exists
+        if os.path.exists(os.path.join(local_ckpt_dir, "config.json")):
+            log.info(f"Using cached checkpoint: {local_ckpt_dir}")
+            return local_ckpt_dir
+        else:
+            log.warning(f"Found cached directory {local_ckpt_dir} but config.json is missing. Re-downloading.")
+            shutil.rmtree(local_ckpt_dir)
     
     os.makedirs(local_ckpt_dir, exist_ok=True)
     

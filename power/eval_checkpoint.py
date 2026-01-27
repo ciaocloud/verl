@@ -68,6 +68,9 @@ import subprocess
 import sys
 import time
 
+# Silence tokenizers parallelism warning (subprocess workers use forking)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import numpy as np
 import pandas as pd
 import torch
@@ -175,15 +178,24 @@ def download_gcs_checkpoint(gcs_path, exp_name=None):
         parts = prefix.rstrip('/').split('/')
         exp_name = parts[0] if parts else "unknown"
     
-    # Extract checkpoint name (e.g., global_step_100)
-    ckpt_name = os.path.basename(prefix.rstrip('/'))
-    local_ckpt_dir = os.path.join("./checkpoints", exp_name, ckpt_name)
+    # Build local path preserving structure: ./checkpoints/{exp_name}/global_step_X/actor/
+    # Extract the global_step_X part if present
+    match = re.search(r"(global_step_\d+)", prefix)
+    if match:
+        step_dir = match.group(1)
+        # Get remaining path after global_step_X (e.g., "actor")
+        after_step = prefix[prefix.find(step_dir) + len(step_dir):].strip('/')
+        local_ckpt_dir = os.path.join("./checkpoints", exp_name, step_dir, after_step) if after_step else os.path.join("./checkpoints", exp_name, step_dir)
+    else:
+        ckpt_name = os.path.basename(prefix.rstrip('/'))
+        local_ckpt_dir = os.path.join("./checkpoints", exp_name, ckpt_name)
     
     # If already downloaded, reuse if valid
     if os.path.isdir(local_ckpt_dir) and os.listdir(local_ckpt_dir):
-        # Check if config.json exists
-        if os.path.exists(os.path.join(local_ckpt_dir, "config.json")):
-            log.info(f"Using cached checkpoint: {local_ckpt_dir}")
+        # Check if config.json exists (check huggingface subdir too)
+        model_dir = find_model_dir(local_ckpt_dir)
+        if os.path.exists(os.path.join(model_dir, "config.json")):
+            log.info(f"Using cached checkpoint: {model_dir}")
             return local_ckpt_dir
         else:
             log.warning(f"Found cached directory {local_ckpt_dir} but config.json is missing. Re-downloading.")

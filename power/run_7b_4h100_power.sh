@@ -32,17 +32,18 @@ export DATA_DIR="/workspace/data"
 TRAIN_DATA="${DATA_DIR}/train_${DATASET}.parquet"
 VAL_DATA="${DATA_DIR}/test_128.parquet"
 
-max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 8))
+max_prompt_length=$((1024 * 1))
+max_response_length=$((1024 * 3))
+
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 enable_filter_groups=True
 filter_groups_metric=acc
 
-sp_size=2
+sp_size=1
 gen_tp=2
-ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
+ppo_max_token_len=$((max_prompt_length + max_response_length))
 
     # algorithm.adv_estimator=rloo_batch_std \
     # actor_rollout_ref.actor.policy_loss.loss_mode=power_grpo \
@@ -97,7 +98,7 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 nohup python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
-    actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \

@@ -52,6 +52,8 @@ ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 nohup python verl/power/gcs_checkpoint.py --watch $CKPT_DIR 2>&1 &
 
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 nohup python3 -m verl.trainer.main_ppo \
+    custom_reward_function.path=verl/power/reward.py \
+    custom_reward_function.name=compute_score \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
@@ -104,12 +106,6 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 nohup python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
-    reward_model.reward_manager=dapo \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
     trainer.logger=['console','tensorboard'] \
     trainer.val_before_train=True \
     trainer.n_gpus_per_node=$N_GPUS \
@@ -121,3 +117,10 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 nohup python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir="${CKPT_DIR}" \
     trainer.resume_mode=auto \
     trainer.total_training_steps=100 2>&1 &
+
+    # reward_model.reward_manager=dapo \
+    # +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    # +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    # +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    # +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
+    # +reward_model.reward_kwargs.max_resp_len=${max_response_length} \

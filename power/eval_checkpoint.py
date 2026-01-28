@@ -752,7 +752,15 @@ def run_parallel_eval(pending, args, exp_name, data_files):
             cmd.append("--stats_only")
         
         log.info(f"[Worker {worker_id}, GPU {gpu_ids}] Starting step {step}")
-        proc = subprocess.Popen(cmd, env=env)
+        # Use preexec_fn to make child die when parent dies (even with kill -9)
+        def set_pdeathsig():
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            PR_SET_PDEATHSIG = 1
+            SIGTERM = 15
+            libc.prctl(PR_SET_PDEATHSIG, SIGTERM)
+        
+        proc = subprocess.Popen(cmd, env=env, preexec_fn=set_pdeathsig)
         return proc, local_path, is_downloaded
     
     try:

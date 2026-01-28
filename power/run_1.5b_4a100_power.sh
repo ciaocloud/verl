@@ -3,8 +3,8 @@ set -xeuo pipefail
 
 MODEL_SIZE="Math-1.5B"
 DATASET="dapo17k"
-DATE=$(date +%m%d%H)  # MMDDHH format (e.g., 012015)
-# DATE="012413"
+# DATE=$(date +%m%d%H)  # MMDDHH format (e.g., 012015)
+DATE="012710"
 ALGS="p0-DAPO-rloo-batch"
 
 export N_GPUS=4
@@ -77,7 +77,7 @@ nohup python3 -m verl.trainer.main_ppo \
     trainer.test_freq=10 \
     trainer.project_name=$PROJ_NAME \
     trainer.experiment_name=$EXP_NAME \
-    trainer.total_epochs=3 2>&1 &
-
-    # trainer.resume_mode=resume_path \
-    # trainer.resume_from_path=${CKPT_DIR}/global_step_140 \
+    trainer.resume_mode=resume_path \
+    trainer.resume_from_path=/workspace/global_step_201 \
+    trainer.total_training_steps=400 2>&1 &
+    # trainer.total_epochs=3 2>&1 &

@@ -18,6 +18,7 @@ Metrics related to the PPO trainer.
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable
+import math
 
 import numpy as np
 import torch
@@ -221,6 +222,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    # Log reward extra info metrics (acc, format_ok, etc from enhanced reward functions)
+    if "acc" in batch.non_tensor_batch:
+        acc = np.array(batch.non_tensor_batch["acc"], dtype=float)
+        metrics["reward/acc"] = float(np.mean(acc))
+    
+    if "format_ok" in batch.non_tensor_batch:
+        format_ok = np.array(batch.non_tensor_batch["format_ok"], dtype=float)
+        metrics["reward/format_rate"] = float(np.mean(format_ok))
+
     return metrics
 
 
@@ -379,6 +389,12 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
+def pass_at_k(n: int, c: int, k: int) -> float:
+    if n - c < k:
+        return 1.0
+    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
+
+
 def process_validation_metrics(
     data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
 ) -> dict[str, dict[str, dict[str, float]]]:
@@ -415,6 +431,7 @@ def process_validation_metrics(
         - "worst@N/std": Standard deviation of the worst values in bootstrap samples
         - "maj@N/mean": Mean of majority voting results in bootstrap samples (if "pred" exists)
         - "maj@N/std": Standard deviation of majority voting results (if "pred" exists)
+        - "pass@N": Pass@N metric for binary rewards
 
     Example:
         >>> data_sources = ["source1", "source1", "source2"]
@@ -444,7 +461,7 @@ def process_validation_metrics(
                 metric[f"mean@{n_resps}"] = np.mean(var_vals)
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = np.std(var_vals)
+                    # metric[f"std@{n_resps}"] = np.std(var_vals) # Skipped std@N
 
                     ns = []
                     n = 2
@@ -453,23 +470,31 @@ def process_validation_metrics(
                         n *= 2
                     ns.append(n_resps)
 
-                    for n in ns:
-                        [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
-                            data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
-                        )
-                        metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
-                        metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
+                    # Only compute advanced metrics for the main reward/score, not aux metrics like acc/format_ok
+                    # Assuming main reward is 'score' or 'reward' or doesn't have 'acc'/'format' in name
+                    is_aux_metric = var_name in ["acc", "format_ok", "format_rate"]
+                    if is_aux_metric:
+                        continue
+
+                        # Check if binary for pass@k
+                        is_binary = np.all(np.isin(var_vals, [0, 1]))
+                        if is_binary:
+                            c = np.sum(var_vals)
+                            for n in ns:
+                                metric[f"pass@{n}"] = pass_at_k(n_resps, int(c), n)
+
+                        # Compute maj@N only for largest N if pred exists (skip best@N, use pass@N instead)
                         if var2vals.get("pred", None) is not None:
                             vote_data = [
                                 {"val": val, "pred": pred} for val, pred in zip(var_vals, var2vals["pred"], strict=True)
                             ]
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(
                                 data=vote_data,
-                                subset_size=n,
+                                subset_size=n_resps,
                                 reduce_fns=[partial(calc_maj_val, vote_key="pred", val_key="val")],
                                 seed=seed,
                             )
-                            metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
+                            metric[f"maj@{n_resps}/mean"], metric[f"maj@{n_resps}/std"] = maj_n_mean, maj_n_std
 
                 data_src2uid2var2metric[data_source][uid][var_name] = metric
 

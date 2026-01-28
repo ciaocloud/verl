@@ -674,6 +674,8 @@ def log_all_summaries(summaries, tensorboard_dir, wandb_project, wandb_run, exp_
 
 def run_parallel_eval(pending, args, exp_name, data_files):
     """Run parallel evaluation across multiple GPUs."""
+    import signal
+    
     total_gpus = args.num_gpus or DEFAULT_PARALLEL
     num_workers = max(1, total_gpus // args.tensor_parallel_size)
     
@@ -684,6 +686,28 @@ def run_parallel_eval(pending, args, exp_name, data_files):
     pending_iter = iter(pending)
     completed = 0
     summaries = {}
+    
+    def cleanup_all_workers():
+        """Kill all worker processes on exit."""
+        for worker_id, (proc, step, local_path, is_downloaded) in list(workers.items()):
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            log.info(f"[Manager] Terminated worker {worker_id} (step {step})")
+    
+    def signal_handler(signum, frame):
+        log.warning(f"[Manager] Received signal {signum}, cleaning up workers...")
+        cleanup_all_workers()
+        sys.exit(1)
+    
+    # Install signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     def start_worker(worker_id, step, ckpt_path):
         """Start subprocess on assigned GPU(s)."""
@@ -731,45 +755,54 @@ def run_parallel_eval(pending, args, exp_name, data_files):
         proc = subprocess.Popen(cmd, env=env)
         return proc, local_path, is_downloaded
     
-    # Initial launch
-    for worker_id in range(num_workers):
-        try:
-            step, ckpt_path = next(pending_iter)
-            proc, local_path, is_downloaded = start_worker(worker_id, step, ckpt_path)
-            workers[worker_id] = (proc, step, local_path, is_downloaded)
-        except StopIteration:
-            break
-    
-    # Poll until all done
-    while workers:
-        time.sleep(1)
-        for worker_id in list(workers.keys()):
-            proc, step, local_path, is_downloaded = workers[worker_id]
-            ret = proc.poll()
-            if ret is None:
-                continue
-            
-            completed += 1
-            if ret == 0:
-                log.info(f"[Worker {worker_id}] Step {step} completed ({completed}/{len(pending)})")
-                summary_file = os.path.join(args.output, f"eval_step_{step}_summary.json")
-                if os.path.exists(summary_file):
-                    with open(summary_file) as f:
-                        summaries[step] = json.load(f)
-            else:
-                log.warning(f"[Worker {worker_id}] Step {step} failed (exit code {ret})")
-            
-            cleanup_checkpoint(local_path, is_downloaded, args.keep_downloads)
-            
-            # Start next task
+    try:
+        # Initial launch
+        for worker_id in range(num_workers):
             try:
-                next_step, next_ckpt = next(pending_iter)
-                proc, local_path, is_downloaded = start_worker(worker_id, next_step, next_ckpt)
-                workers[worker_id] = (proc, next_step, local_path, is_downloaded)
+                step, ckpt_path = next(pending_iter)
+                proc, local_path, is_downloaded = start_worker(worker_id, step, ckpt_path)
+                workers[worker_id] = (proc, step, local_path, is_downloaded)
             except StopIteration:
-                del workers[worker_id]
+                break
+        
+        # Poll until all done
+        while workers:
+            time.sleep(1)
+            for worker_id in list(workers.keys()):
+                proc, step, local_path, is_downloaded = workers[worker_id]
+                ret = proc.poll()
+                if ret is None:
+                    continue
+                
+                completed += 1
+                if ret == 0:
+                    log.info(f"[Worker {worker_id}] Step {step} completed ({completed}/{len(pending)})")
+                    summary_file = os.path.join(args.output, f"eval_step_{step}_summary.json")
+                    if os.path.exists(summary_file):
+                        with open(summary_file) as f:
+                            summaries[step] = json.load(f)
+                else:
+                    log.warning(f"[Worker {worker_id}] Step {step} failed (exit code {ret})")
+                
+                cleanup_checkpoint(local_path, is_downloaded, args.keep_downloads)
+                
+                # Start next task
+                try:
+                    next_step, next_ckpt = next(pending_iter)
+                    proc, local_path, is_downloaded = start_worker(worker_id, next_step, next_ckpt)
+                    workers[worker_id] = (proc, next_step, local_path, is_downloaded)
+                except StopIteration:
+                    del workers[worker_id]
+        
+        return summaries
     
-    return summaries
+    except Exception as e:
+        log.error(f"[Manager] Error: {e}, cleaning up workers...")
+        cleanup_all_workers()
+        raise
+    finally:
+        # Ensure no zombie workers remain even on clean exit
+        cleanup_all_workers()
 
 
 # ================= Main Entry Point =================

@@ -51,7 +51,7 @@ ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 
 nohup python verl/power/gcs_checkpoint.py --watch $CKPT_DIR 2>&1 &
 
-nohup python3 -m verl.trainer.main_ppo \
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 nohup python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \

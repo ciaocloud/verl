@@ -28,6 +28,7 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+import verl.lotis.loss  # Register LOTIS loss
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -96,6 +97,48 @@ class DataParallelPPOActor(BasePPOActor):
             self.scaler = ShardedGradScaler(growth_interval=400)
         else:
             self.scaler = None
+
+        # LOTIS modules (learnable sequence/token weighting)
+        # Wrapped in DDP to sync across actor workers
+        self.lotis_phi = None
+        self.lotis_tis = None
+        lotis_config = self.config.get("lotis", None)
+        if lotis_config is not None and actor_optimizer is not None:
+            from verl.lotis.modules import RBFLengthWeightModule, TISWeightModule
+            
+            lotis_params = []
+            if getattr(lotis_config.length_weight, "enable", False):
+                self.lotis_phi = RBFLengthWeightModule(lotis_config.length_weight).to(get_device_id())
+                # Wrap in DDP for gradient sync across workers
+                if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                    self.lotis_phi = torch.nn.parallel.DistributedDataParallel(
+                        self.lotis_phi, device_ids=[get_device_id()]
+                    )
+                lotis_params.append({
+                    "params": self.lotis_phi.parameters(),
+                    "lr": lotis_config.length_weight.alpha_lr,
+                    "weight_decay": 0.0,
+                })
+                if torch.distributed.get_rank() == 0:
+                    print(f"LOTIS: phi module enabled (DDP), K={lotis_config.length_weight.num_rbf_kernels}")
+            
+            if getattr(lotis_config.tis_weight, "enable", False):
+                self.lotis_tis = TISWeightModule(lotis_config.tis_weight).to(get_device_id())
+                if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                    self.lotis_tis = torch.nn.parallel.DistributedDataParallel(
+                        self.lotis_tis, device_ids=[get_device_id()]
+                    )
+                lotis_params.append({
+                    "params": self.lotis_tis.parameters(),
+                    "lr": lotis_config.tis_weight.beta_lr,
+                    "weight_decay": 0.0,
+                })
+                if torch.distributed.get_rank() == 0:
+                    print(f"LOTIS: tis module enabled (DDP), beta_init={lotis_config.tis_weight.beta_init}")
+            
+            # Add LOTIS params to actor optimizer
+            for group in lotis_params:
+                actor_optimizer.add_param_group(group)
 
         # Sum of squared probabilities computation (for optimal_token_baseline)
         # Only initialize if calculate_sum_pi_squared config is enabled
@@ -517,7 +560,8 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.use_prefix_grouper and "prompts" in data.batch.keys():
             select_keys.append("prompts")
-        if self.config.use_kl_loss:
+        # Include ref_log_prob for KL loss or LOTIS TIS
+        if self.config.use_kl_loss or self.lotis_tis is not None or "ref_log_prob" in data.batch.keys():
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
@@ -600,9 +644,27 @@ class DataParallelPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
+                    # Compute LOTIS weights locally (DDP syncs gradients)
+                    phi_weights = None
+                    tis_weights = None
+                    if self.lotis_phi is not None:
+                        phi_weights = self.lotis_phi(response_mask)
+                    ref_log_prob = model_inputs.get("ref_log_prob", None)
+                    if self.lotis_tis is not None and ref_log_prob is not None:
+                        tis_weights = self.lotis_tis(log_prob, ref_log_prob, response_mask)
+                    # Auto-switch to lotis loss mode if weights computed
+                    if phi_weights is not None or tis_weights is not None:
+                        loss_mode = "lotis"
+
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                    # Prepare extra arguments for LOTIS if enabled
+                    lotis_kwargs = {}
+                    if loss_mode == "lotis":
+                        lotis_kwargs["phi_weights"] = phi_weights
+                        lotis_kwargs["tis_weights"] = tis_weights
 
                     # Compute policy loss (any function is expected to return 2 values)
                     pg_loss, pg_metrics = policy_loss_fn(
@@ -613,8 +675,15 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        **lotis_kwargs,
                     )
                     micro_batch_metrics.update(pg_metrics)
+                    
+                    # Log LOTIS metrics
+                    if phi_weights is not None:
+                        micro_batch_metrics["actor/lotis_phi_mean"] = phi_weights.mean().item()
+                    if tis_weights is not None:
+                        micro_batch_metrics["actor/lotis_tis_mean"] = tis_weights[response_mask.bool()].mean().item()
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
@@ -664,6 +733,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                # Log LOTIS learnable params
+                if self.lotis_phi is not None:
+                    phi_mod = self.lotis_phi.module if hasattr(self.lotis_phi, 'module') else self.lotis_phi
+                    mini_batch_metrics["actor/lotis_alphas_mean"] = phi_mod.alphas.mean().item()
+                if self.lotis_tis is not None:
+                    tis_mod = self.lotis_tis.module if hasattr(self.lotis_tis, 'module') else self.lotis_tis
+                    mini_batch_metrics["actor/lotis_beta"] = tis_mod.beta.item()
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

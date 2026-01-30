@@ -24,8 +24,9 @@ from verl.utils.profiler.config import ProfilerConfig
 from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
+from verl.lotis.config import LOTISConfig
 
-__all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
+__all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig", "LOTISConfig"]
 
 
 @dataclass
@@ -164,6 +165,7 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+    lotis: LOTISConfig = field(default_factory=LOTISConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size

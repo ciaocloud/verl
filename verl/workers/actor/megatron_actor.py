@@ -38,6 +38,7 @@ from torch import nn
 
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+import verl.lotis.loss  # Register LOTIS loss
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
@@ -182,6 +183,46 @@ class MegatronPPOActor(BasePPOActor):
         config = get_model_config(self.actor_module[0])
         print(config)
         config.finalize_model_grads_func = finalize_model_grads
+
+        # LOTIS modules (use separate optimizer for Megatron, DDP for sync)
+        self.lotis_phi = None
+        self.lotis_tis = None
+        self.lotis_optimizer = None
+        lotis_config = self.config.get("lotis", None)
+        if lotis_config is not None:
+            from verl.lotis.modules import RBFLengthWeightModule, TISWeightModule
+            from verl.utils.device import get_device_id
+            
+            lotis_params = []
+            if getattr(lotis_config.length_weight, "enable", False):
+                self.lotis_phi = RBFLengthWeightModule(lotis_config.length_weight).to(get_device_id())
+                if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                    self.lotis_phi = torch.nn.parallel.DistributedDataParallel(
+                        self.lotis_phi, device_ids=[get_device_id()]
+                    )
+                lotis_params.append({
+                    "params": self.lotis_phi.parameters(),
+                    "lr": lotis_config.length_weight.alpha_lr,
+                })
+                if mpu.get_data_parallel_rank() == 0:
+                    print(f"LOTIS: phi module enabled (DDP), K={lotis_config.length_weight.num_rbf_kernels}")
+            
+            if getattr(lotis_config.tis_weight, "enable", False):
+                self.lotis_tis = TISWeightModule(lotis_config.tis_weight).to(get_device_id())
+                if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                    self.lotis_tis = torch.nn.parallel.DistributedDataParallel(
+                        self.lotis_tis, device_ids=[get_device_id()]
+                    )
+                lotis_params.append({
+                    "params": self.lotis_tis.parameters(),
+                    "lr": lotis_config.tis_weight.beta_lr,
+                })
+                if mpu.get_data_parallel_rank() == 0:
+                    print(f"LOTIS: tis module enabled (DDP), beta_init={lotis_config.tis_weight.beta_init}")
+            
+            if lotis_params:
+                # Separate optimizer for LOTIS (Megatron uses DistributedOptimizer)
+                self.lotis_optimizer = torch.optim.Adam(lotis_params)
 
     def _validate_config(self, config) -> None:
         """Validate config options not implemented for Megatron backend"""
@@ -364,7 +405,8 @@ class MegatronPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
-        if self.config.use_kl_loss:
+        # Include ref_log_prob for KL loss or LOTIS TIS
+        if self.config.use_kl_loss or self.lotis_tis is not None or "ref_log_prob" in data.batch.keys():
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
@@ -502,12 +544,31 @@ class MegatronPPOActor(BasePPOActor):
                 loss_agg_mode = self.config.loss_agg_mode
 
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                
+                # Compute LOTIS weights locally (DDP syncs gradients)
+                phi_weights = None
+                tis_weights = None
+                if self.lotis_phi is not None:
+                    phi_weights = self.lotis_phi(response_mask)
+                ref_log_prob = data.get("ref_log_prob", None)
+                if self.lotis_tis is not None and ref_log_prob is not None:
+                    tis_weights = self.lotis_tis(log_prob, ref_log_prob, response_mask)
+                # Auto-switch to lotis loss mode if weights computed
+                if phi_weights is not None or tis_weights is not None:
+                    loss_mode = "lotis"
 
                 policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                 # Extract pre-computed rollout correction weights if present
                 # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                 rollout_is_weights = data.get("rollout_is_weights", None)
+
+                # Prepare extra arguments for LOTIS if enabled
+                lotis_kwargs = {}
+                if loss_mode == "lotis":
+                    lotis_kwargs["phi_weights"] = phi_weights
+                    lotis_kwargs["tis_weights"] = tis_weights
+
                 pg_loss, pg_metrics = policy_loss_fn(
                     old_log_prob=old_log_prob,
                     log_prob=log_prob,
@@ -516,8 +577,15 @@ class MegatronPPOActor(BasePPOActor):
                     loss_agg_mode=loss_agg_mode,
                     config=self.config,
                     rollout_is_weights=rollout_is_weights,
+                    **lotis_kwargs,
                 )
                 stats.update(pg_metrics)
+                
+                # Log LOTIS metrics
+                if phi_weights is not None:
+                    stats["actor/lotis_phi_mean"] = phi_weights.mean().item()
+                if tis_weights is not None:
+                    stats["actor/lotis_tis_mean"] = tis_weights[response_mask].mean().item()
 
                 # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                 rollout_log_prob = data.get("rollout_log_probs", None)
@@ -806,7 +874,20 @@ class MegatronPPOActor(BasePPOActor):
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
+            
+            # Step LOTIS optimizer if enabled
+            if self.lotis_optimizer is not None:
+                self.lotis_optimizer.step()
+                self.lotis_optimizer.zero_grad()
+            
             data = {"actor/grad_norm": grad_norm}
+            # Log LOTIS learnable params
+            if self.lotis_phi is not None:
+                phi_mod = self.lotis_phi.module if hasattr(self.lotis_phi, 'module') else self.lotis_phi
+                data["actor/lotis_alphas_mean"] = phi_mod.alphas.mean().item()
+            if self.lotis_tis is not None:
+                tis_mod = self.lotis_tis.module if hasattr(self.lotis_tis, 'module') else self.lotis_tis
+                data["actor/lotis_beta"] = tis_mod.beta.item()
             append_to_dict(metrics, data)
 
             if update_successful:

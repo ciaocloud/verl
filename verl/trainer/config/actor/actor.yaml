@@ -252,3 +252,28 @@ router_replay:
   # Required when mode is 'replay'
   replay_file: null
 
+# LOTIS configuration
+lotis:
+  # Target dataclass for this configuration
+  _target_: verl.lotis.config.LOTISConfig
+
+  length_weight:
+    _target_: verl.lotis.config.LengthWeightConfig
+    enable: false
+    num_rbf_kernels: 5
+    rbf_centers: null
+    rbf_bandwidth: 1.0
+    alpha_init: 0.0
+    alpha_lr: 0.001
+    phi_clip_min: 0.2
+    phi_clip_max: 5.0
+
+  tis_weight:
+    _target_: verl.lotis.config.TISWeightConfig
+    enable: false
+    gamma_init: 0.1
+    gamma_lr: 0.001
+    gamma_max: 3.0
+    wt_clip_min: 0.2
+    wt_clip_max: 5.0
+    div_clip: 2.0

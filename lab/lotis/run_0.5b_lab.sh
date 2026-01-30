@@ -4,7 +4,7 @@ set -xeuo pipefail
 # Experiment config
 MODEL_SIZE="0.5B"
 DATASET="gsm8k"
-DATE=$(date +%m%d)  # MMDDHH format (e.g., 012014)
+DATE=$(date +%m%d%H)  # MMDDHH format (e.g., 012014)
 
 export GOOGLE_APPLICATION_CREDENTIALS=/wx-gcs-key.json 
 export WANDB_API_KEY=$(cat /workspace/wx-wandb-api-key.txt)
@@ -12,7 +12,7 @@ export N_GPUS=1
 export BASE_MODEL="Qwen/Qwen2.5-${MODEL_SIZE}-Instruct"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl-lotis'
-export EXP_NAME="LOTIS-${MODEL_SIZE}-${DATASET}-${DATE}"
+export EXP_NAME="LASER-${MODEL_SIZE}-${DATASET}-${DATE}"
 
 # Use verl's default checkpoint path
 export CKPT_DIR="checkpoints/${PROJ_NAME}/${EXP_NAME}"
@@ -48,11 +48,9 @@ nohup python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.lotis.length_weight.enable=True \
-    actor_rollout_ref.actor.lotis.length_weight.num_rbf_kernels=5 \
-    actor_rollout_ref.actor.lotis.length_weight.alpha_lr=0.01 \
-    actor_rollout_ref.actor.lotis.tis_weight.enable=True \
-    actor_rollout_ref.actor.lotis.tis_weight.beta_init=1.0 \
-    actor_rollout_ref.actor.lotis.tis_weight.beta_lr=0.01 \
+    actor_rollout_ref.actor.lotis.length_weight.lr=0.001 \
+    actor_rollout_ref.actor.lotis.token_weight.enable=True \
+    actor_rollout_ref.actor.lotis.token_weight.lr=0.001 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -76,7 +74,7 @@ nohup python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=1 \
+    trainer.save_freq=10 \
     trainer.test_freq=10 \
     trainer.project_name=$PROJ_NAME \
     trainer.experiment_name=$EXP_NAME \

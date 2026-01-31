@@ -648,10 +648,12 @@ class DataParallelPPOActor(BasePPOActor):
                     phi_weights = None
                     tis_weights = None
                     if self.lotis_phi is not None:
-                        phi_weights = self.lotis_phi(response_mask)
+                        phi_weights, phi_metrics = self.lotis_phi(response_mask)
+                        micro_batch_metrics.update(phi_metrics)
                     ref_log_prob = model_inputs.get("ref_log_prob", None)
                     if self.lotis_tis is not None and ref_log_prob is not None:
-                        tis_weights = self.lotis_tis(log_prob, ref_log_prob, response_mask)
+                        tis_weights, tis_metrics = self.lotis_tis(log_prob, ref_log_prob, response_mask)
+                        micro_batch_metrics.update(tis_metrics)
                     # Auto-switch to lotis loss mode if weights computed
                     if phi_weights is not None or tis_weights is not None:
                         loss_mode = "lotis"
@@ -679,11 +681,29 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     micro_batch_metrics.update(pg_metrics)
                     
-                    # Log LOTIS metrics
-                    if phi_weights is not None:
-                        micro_batch_metrics["actor/lotis_phi_mean"] = phi_weights.mean().item()
-                    if tis_weights is not None:
-                        micro_batch_metrics["actor/lotis_tis_mean"] = tis_weights[response_mask.bool()].mean().item()
+                    # Log correlations with advantage
+                    if phi_weights is not None or tis_weights is not None:
+                        seq_len = response_mask.sum(dim=1).float()
+                        seq_adv = (advantages * response_mask).sum(dim=1) # Proxy for return
+                        
+                        if seq_len.shape[0] > 1:
+                            # 1. Length vs Advantage
+                            corr_len = torch.corrcoef(torch.stack([seq_len, seq_adv]))[0, 1].item()
+                            micro_batch_metrics["lotis/corr_len_adv"] = corr_len
+                            
+                            # 2. Phi Weight vs Advantage
+                            if phi_weights is not None:
+                                corr_phi = torch.corrcoef(torch.stack([phi_weights.detach(), seq_adv]))[0, 1].item()
+                                micro_batch_metrics["lotis/corr_phi_adv"] = corr_phi
+                                
+                        # 3. TIS Weight (token-level) vs Advantage
+                        if tis_weights is not None:
+                            mask_bool = response_mask.bool()
+                            flat_tis = tis_weights.detach()[mask_bool]
+                            flat_adv = advantages[mask_bool]
+                            if flat_tis.numel() > 1:
+                                corr_tis = torch.corrcoef(torch.stack([flat_tis, flat_adv]))[0, 1].item()
+                                micro_batch_metrics["lotis/corr_tis_adv"] = corr_tis                    
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
@@ -733,13 +753,22 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
-                # Log LOTIS learnable params
-                if self.lotis_phi is not None:
-                    phi_mod = self.lotis_phi.module if hasattr(self.lotis_phi, 'module') else self.lotis_phi
-                    mini_batch_metrics["actor/lotis_alphas_mean"] = phi_mod.alphas.mean().item()
-                if self.lotis_tis is not None:
-                    tis_mod = self.lotis_tis.module if hasattr(self.lotis_tis, 'module') else self.lotis_tis
-                    mini_batch_metrics["actor/lotis_beta"] = tis_mod.beta.item()
+
+                # Log LOTIS grad norm ratio (lotis_grad_norm / grad_norm)
+                if self.lotis_phi is not None or self.lotis_tis is not None:
+                    lotis_grad_norm = 0.0
+                    if self.lotis_phi is not None:
+                        for p in self.lotis_phi.parameters():
+                            if p.grad is not None:
+                                lotis_grad_norm += p.grad.detach().data.norm(2).item() ** 2
+                    if self.lotis_tis is not None:
+                        for p in self.lotis_tis.parameters():
+                            if p.grad is not None:
+                                lotis_grad_norm += p.grad.detach().data.norm(2).item() ** 2
+                    lotis_grad_norm = lotis_grad_norm ** 0.5
+                    mini_batch_metrics["lotis/grad_norm"] = lotis_grad_norm
+                    mini_batch_metrics["lotis/grad_ratio"] = lotis_grad_norm / (grad_norm.detach().item() + 1e-6)
+
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

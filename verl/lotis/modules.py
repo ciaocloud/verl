@@ -32,7 +32,7 @@ class RBFLengthWeightModule(nn.Module):
         self.register_buffer("centers", centers)
         self.register_buffer("bandwidth_sq_2", torch.tensor(2.0 * config.rbf_bandwidth ** 2))
 
-    def forward(self, response_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, response_mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute phi weights from response mask.
         
         Args:
@@ -40,6 +40,7 @@ class RBFLengthWeightModule(nn.Module):
             
         Returns:
             phi: (batch_size,) weights normalized to mean=1
+            metrics: dict of metrics
         """
         # Get sequence lengths
         lengths = response_mask.sum(dim=-1).float()  # (batch_size,)
@@ -63,7 +64,23 @@ class RBFLengthWeightModule(nn.Module):
         # Clip for stability
         phi = phi.clamp(self.config.clip_min, self.config.clip_max)
         
-        return phi
+        metrics = {
+            "lotis/response_length_mean": mu.item(),
+            "lotis/response_length_std": sigma.item(),
+            # Center kernel weight (assuming centers are sorted and middle one is ~0)
+            "lotis/rbf_kernel_weight_center": self.alphas[self.config.num_rbf_kernels // 2].item(),
+            "lotis/rbf_alphas_mean": self.alphas.mean().item(),
+            "lotis/rbf_phi_mean": phi.mean().item(),
+            "lotis/rbf_phi_std": phi.std().item(),
+            "lotis/rbf_phi_max": phi.max().item(),
+            "lotis/rbf_phi_min": phi.min().item(),
+        }
+        
+        # Log individual alphas (optional, maybe limit if K is large)
+        for i, alpha in enumerate(self.alphas):
+            metrics[f"lotis/rbf_alpha_{i}"] = alpha.item()
+        
+        return phi, metrics
 
 
 class TISWeightModule(nn.Module):
@@ -97,7 +114,7 @@ class TISWeightModule(nn.Module):
         log_probs: torch.Tensor,
         ref_log_probs: torch.Tensor,
         response_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute TIS weights from log probability divergence.
         
         Args:
@@ -107,6 +124,7 @@ class TISWeightModule(nn.Module):
             
         Returns:
             W: (batch_size, seq_len) weights normalized per sequence
+            metrics: dict of metrics
         """
         # Compute divergence (detach to prevent gradient through diff)
         divergence = torch.abs(log_probs.detach() - ref_log_probs.detach())
@@ -125,4 +143,24 @@ class TISWeightModule(nn.Module):
         # Clip for stability
         W = W.clamp(self.config.clip_min, self.config.clip_max) * response_mask
         
-        return W
+        # KL divergence metrics
+        kl_term = torch.exp(ref_log_probs) * (ref_log_probs - log_probs) * response_mask
+        ref_kl = kl_term.sum() / response_mask.sum()
+        
+        # Weighted KL (weighted by TIS weights)
+        # W is normalized per sequence, so we can just multiply
+        ref_kl_weighted = (kl_term * W).sum() / response_mask.sum()
+
+        w_valid = W[response_mask.bool()]
+        metrics = {
+            "lotis/tis_beta": self.beta.item(),
+            "lotis/tis_weight_mean": w_valid.mean().item(),
+            "lotis/tis_weight_std": w_valid.std().item(),
+            "lotis/tis_weight_max": w_valid.max().item(),
+            "lotis/tis_weight_min": w_valid.min().item(),
+            "lotis/tis_sparsity_ratio": W.max().item() / (w_valid.mean().item() + 1e-6),
+            "lotis/ref_kl_total": ref_kl.item(),
+            "lotis/ref_kl_weighted": ref_kl_weighted.item(),
+        }
+        
+        return W, metrics

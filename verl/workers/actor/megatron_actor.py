@@ -203,10 +203,11 @@ class MegatronPPOActor(BasePPOActor):
                 lotis_params.append({
                     "params": self.lotis_phi.parameters(),
                     "lr": lotis_config.length_weight.alpha_lr,
+                    "weight_decay": 0.0,
                 })
                 if mpu.get_data_parallel_rank() == 0:
                     print(f"LOTIS: phi module enabled (DDP), K={lotis_config.length_weight.num_rbf_kernels}")
-            
+
             if getattr(lotis_config.tis_weight, "enable", False):
                 self.lotis_tis = TISWeightModule(lotis_config.tis_weight).to(get_device_id())
                 if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
@@ -216,6 +217,7 @@ class MegatronPPOActor(BasePPOActor):
                 lotis_params.append({
                     "params": self.lotis_tis.parameters(),
                     "lr": lotis_config.tis_weight.beta_lr,
+                    "weight_decay": 0.0,
                 })
                 if mpu.get_data_parallel_rank() == 0:
                     print(f"LOTIS: tis module enabled (DDP), beta_init={lotis_config.tis_weight.beta_init}")
@@ -549,10 +551,12 @@ class MegatronPPOActor(BasePPOActor):
                 phi_weights = None
                 tis_weights = None
                 if self.lotis_phi is not None:
-                    phi_weights = self.lotis_phi(response_mask)
+                    phi_weights, phi_metrics = self.lotis_phi(response_mask)
+                    stats.update(phi_metrics)
                 ref_log_prob = data.get("ref_log_prob", None)
                 if self.lotis_tis is not None and ref_log_prob is not None:
-                    tis_weights = self.lotis_tis(log_prob, ref_log_prob, response_mask)
+                    tis_weights, tis_metrics = self.lotis_tis(log_prob, ref_log_prob, response_mask)
+                    stats.update(tis_metrics)
                 # Auto-switch to lotis loss mode if weights computed
                 if phi_weights is not None or tis_weights is not None:
                     loss_mode = "lotis"
@@ -580,12 +584,32 @@ class MegatronPPOActor(BasePPOActor):
                     **lotis_kwargs,
                 )
                 stats.update(pg_metrics)
+                                
+                # Log correlations with advantage
+                if phi_weights is not None or tis_weights is not None:
+                    seq_len = response_mask.sum(dim=1).float()
+                    seq_adv = (advantages * response_mask).sum(dim=1) # Proxy for return
+                    
+                    if seq_len.shape[0] > 1:
+                        # 1. Length vs Advantage
+                        corr_len = torch.corrcoef(torch.stack([seq_len, seq_adv]))[0, 1].item()
+                        stats["lotis/corr_len_adv"] = corr_len
+                        
+                        # 2. Phi Weight vs Advantage
+                        if phi_weights is not None:
+                            corr_phi = torch.corrcoef(torch.stack([phi_weights.detach(), seq_adv]))[0, 1].item()
+                            stats["lotis/corr_phi_adv"] = corr_phi
+                            
+                    # 3. TIS Weight (token-level) vs Advantage
+                    if tis_weights is not None:
+                        mask_bool = response_mask.bool()
+                        flat_tis = tis_weights.detach()[mask_bool]
+                        flat_adv = advantages[mask_bool]
+                        if flat_tis.numel() > 1:
+                            corr_tis = torch.corrcoef(torch.stack([flat_tis, flat_adv]))[0, 1].item()
+                            stats["lotis/corr_tis_adv"] = corr_tis
                 
-                # Log LOTIS metrics
-                if phi_weights is not None:
-                    stats["actor/lotis_phi_mean"] = phi_weights.mean().item()
-                if tis_weights is not None:
-                    stats["actor/lotis_tis_mean"] = tis_weights[response_mask].mean().item()
+                # Log LOTIS grad norm ratio (moved to mini-batch level)
 
                 # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                 rollout_log_prob = data.get("rollout_log_probs", None)
@@ -874,20 +898,7 @@ class MegatronPPOActor(BasePPOActor):
                 append_to_dict(metrics, metric[0])  # append the metric from this micro-batch to global metrics.
 
             update_successful, grad_norm, num_zeros_in_grad = self.actor_optimizer.step()
-            
-            # Step LOTIS optimizer if enabled
-            if self.lotis_optimizer is not None:
-                self.lotis_optimizer.step()
-                self.lotis_optimizer.zero_grad()
-            
             data = {"actor/grad_norm": grad_norm}
-            # Log LOTIS learnable params
-            if self.lotis_phi is not None:
-                phi_mod = self.lotis_phi.module if hasattr(self.lotis_phi, 'module') else self.lotis_phi
-                data["actor/lotis_alphas_mean"] = phi_mod.alphas.mean().item()
-            if self.lotis_tis is not None:
-                tis_mod = self.lotis_tis.module if hasattr(self.lotis_tis, 'module') else self.lotis_tis
-                data["actor/lotis_beta"] = tis_mod.beta.item()
             append_to_dict(metrics, data)
 
             if update_successful:
@@ -899,6 +910,27 @@ class MegatronPPOActor(BasePPOActor):
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.clear_global_router_replay_action()
                 RouterReplay.clear_global_indices()
+
+        # Step LOTIS optimizer if enabled
+        if self.lotis_optimizer is not None:
+            self.lotis_optimizer.step()
+        if self.lotis_phi is not None or self.lotis_tis is not None:
+            lotis_grad_norm = 0.0
+            if self.lotis_phi is not None:
+                for p in self.lotis_phi.parameters():
+                    if p.grad is not None:
+                        lotis_grad_norm += p.grad.detach().data.norm(2).item() ** 2
+            if self.lotis_tis is not None:
+                for p in self.lotis_tis.parameters():
+                    if p.grad is not None:
+                        lotis_grad_norm += p.grad.detach().data.norm(2).item() ** 2
+            lotis_grad_norm = lotis_grad_norm ** 0.5                
+            # Handle grad_norm being potentially a tensor or float
+            grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            logit_grad_ratio = {"lotis/grad_ratio": lotis_grad_norm / (grad_norm_val + 1e-6)}
+            append_to_dict(metrics, logit_grad_ratio)
+        if self.lotis_optimizer is not None:
+            self.lotis_optimizer.zero_grad()
 
         self.actor_optimizer.zero_grad()
         get_torch_device().empty_cache()

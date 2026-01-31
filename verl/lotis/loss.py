@@ -13,7 +13,7 @@ def compute_lotis_policy_loss(
     log_prob: torch.Tensor,
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
-    loss_agg_mode: str = "token-mean",
+    loss_agg_mode: str = "seq-mean-token-sum",
     config=None,
     # LOTIS weights (computed by actor's lotis module)
     phi_weights: Optional[torch.Tensor] = None,
@@ -61,28 +61,30 @@ def compute_lotis_policy_loss(
     
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
     
-    # Aggregate loss
-    if phi_weights is not None:
-        # Sequence-level weighting: weight each sequence's mean loss by phi
-        seq_losses = (pg_losses * response_mask).sum(dim=-1)  # (batch_size,)
-        seq_lens = response_mask.sum(dim=-1).clamp(min=1)
-        weighted_seq_losses = phi_weights * seq_losses / seq_lens
-        pg_loss = weighted_seq_losses.mean()
-    else:
-        # Standard aggregation
-        pg_loss = agg_loss(pg_losses, response_mask, loss_agg_mode)
+    # # Aggregate loss
+    # if phi_weights is not None:
+    #     pg_losses = pg_losses * phi_weights.unsqueeze(-1) # broadcast phi_weights: (B,) -> (B, 1)
+    # pg_loss = agg_loss(pg_losses, response_mask, loss_agg_mode)
     
-    # Build metrics
-    metrics = {
-        "pg_clipfrac": pg_clipfrac.detach(),
-        "ppo_kl": ppo_kl.detach(),
-        "pg_clipfrac_lower": torch.tensor(0.0, device=pg_loss.device),
+    if phi_weights is not None:
+        # Sequence-level weighting: weight each sequence's loss by phi
+        # DAPO-style aggregation (loss_agg_mode == "seq-mean-token-sum")
+        seq_losses = (pg_losses * response_mask).sum(dim=-1)  # (batch_size,)
+        weighted_sum = (phi_weights * seq_losses).sum()
+        total_tokens = response_mask.sum().clamp(min=1)
+        pg_loss = weighted_sum / total_tokens
+        # # GRPO-style aggregation (loss_agg_mode == "token-mean")
+        # seq_losses = (pg_losses * response_mask).sum(dim=-1)  # (batch_size,)
+        # seq_lens = response_mask.sum(dim=-1).clamp(min=1)
+        # weighted_seq_losses = phi_weights * seq_losses / seq_lens
+        # pg_loss = weighted_seq_losses.mean()
+    else:
+        pg_loss = agg_loss(pg_losses, response_mask, loss_agg_mode)
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": 0.0,
     }
     
-    # Add weight stats
-    if phi_weights is not None:
-        metrics["lotis/phi_mean"] = phi_weights.mean().detach()
-    if tis_weights is not None:
-        metrics["lotis/tis_mean"] = tis_weights[response_mask.bool()].mean().detach()
-    
-    return pg_loss, metrics
+    return pg_loss, pg_metrics

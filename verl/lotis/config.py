@@ -17,9 +17,9 @@ class LengthWeightConfig(BaseConfig):
     rbf_centers: Optional[List[float]] = None  # None = auto linspace(-2, 2, K)
     rbf_bandwidth: float = 1.0
     alpha_init: float = 0.0  # 0 means phi=1 at init (standard GRPO)
-    alpha_lr: float = 0.01
-    clip_min: float = 0.1
-    clip_max: float = 10.0
+    alpha_lr: float = 0.001
+    clip_min: float = 0.2
+    clip_max: float = 5.0
 
 
 @dataclass
@@ -29,10 +29,10 @@ class TISWeightConfig(BaseConfig):
     When disabled, falls back to uniform token weighting.
     """
     enable: bool = False
-    beta_init: float = 1.0
-    beta_lr: float = 0.01
-    clip_min: float = 0.1
-    clip_max: float = 10.0
+    beta_init: float = 0.1 
+    beta_lr: float = 0.001
+    clip_min: float = 0.2
+    clip_max: float = 5.0
 
 
 @dataclass

@@ -60,7 +60,7 @@ actor_rollout_ref:
 
 ## Metrics
 
-- `actor/lotis_alphas_mean`: RBF alpha params
-- `actor/lotis_beta`: TIS beta param
-- `actor/lotis_phi_mean`: Sequence weight mean
-- `actor/lotis_tis_mean`: Token weight mean
+- `lotis/rbf_alphas_mean`: RBF alpha params
+- `lotis/tis_beta`: TIS beta param
+- `lotis/rbf_phi_mean`: Sequence weight mean
+- `lotis/tis_weight_mean`: Token weight mean

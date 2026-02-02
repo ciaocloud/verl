@@ -18,8 +18,8 @@ class LengthWeightConfig(BaseConfig):
     rbf_bandwidth: float = 1.0
     alpha_init: float = 0.0  # 0 means phi=1 at init (standard GRPO)
     alpha_lr: float = 0.001
-    clip_min: float = 0.2
-    clip_max: float = 5.0
+    phi_clip_min: float = 0.2
+    phi_clip_max: float = 5.0
 
 
 @dataclass
@@ -31,8 +31,10 @@ class TISWeightConfig(BaseConfig):
     enable: bool = False
     beta_init: float = 0.1 
     beta_lr: float = 0.001
-    clip_min: float = 0.2
-    clip_max: float = 5.0
+    beta_max: float = 3.0
+    wt_clip_min: float = 0.2
+    wt_clip_max: float = 5.0
+    div_clip: float = 2.0
 
 
 @dataclass

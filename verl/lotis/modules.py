@@ -62,7 +62,7 @@ class RBFLengthWeightModule(nn.Module):
         phi = phi_raw / phi_raw.mean().clamp(min=1e-8)
         
         # Clip for stability
-        phi = phi.clamp(self.config.clip_min, self.config.clip_max)
+        phi = phi.clamp(self.config.phi_clip_min, self.config.phi_clip_max)
         
         metrics = {
             "lotis/response_length_mean": mu.item(),
@@ -99,15 +99,28 @@ class TISWeightModule(nn.Module):
         self._init_beta(config.beta_init)
 
     def _init_beta(self, target: float):
-        """Initialize beta_raw so softplus(beta_raw) = target."""
-        if target > 20:
-            self._beta_raw.data.fill_(target)
+        """Initialize beta_raw so beta_max * tanh(softplus(beta_raw)) = target."""
+        max_val = getattr(self.config, "beta_max", 3.0)
+        # Clamp target to valid range (0, max_val)
+        target = max(1e-6, min(max_val - 1e-6, target))
+        # y = arctanh(target / max_val)
+        ratio = target / max_val
+        # arctanh(x) = 0.5 * log((1+x)/(1-x))
+        y = 0.5 * math.log((1 + ratio) / (1 - ratio))
+        # x = inv_softplus(y)
+        if y > 20:
+            self._beta_raw.data.fill_(y)
         else:
-            self._beta_raw.data.fill_(math.log(math.exp(target) - 1))
+            val = math.exp(y) - 1
+            val = max(1e-6, val)
+            self._beta_raw.data.fill_(math.log(val))
 
     @property
     def beta(self) -> torch.Tensor:
-        return F.softplus(self._beta_raw)
+        # Bounded beta: beta_max * tanh(softplus(beta_raw))
+        # Prevents sparsity collapse, ensuring credit assignment to "scaffolding" tokens
+        max_val = getattr(self.config, "beta_max", 3.0)
+        return max_val * torch.tanh(F.softplus(self._beta_raw))
 
     def forward(
         self,
@@ -129,8 +142,16 @@ class TISWeightModule(nn.Module):
         # Compute divergence (detach to prevent gradient through diff)
         divergence = torch.abs(log_probs.detach() - ref_log_probs.detach())
         
+        # Clip divergence to prevent exploding weights/gradients from outliers
+        # This ensures we still learn from large divergences (gradient flows through beta)
+        # without numerical instability.
+        if hasattr(self.config, "div_clip") and self.config.div_clip > 0:
+            divergence = divergence.clamp(min=1e-6, max=self.config.div_clip)
+        else:
+            divergence = divergence.clamp(min=1e-6)
+        
         # Apply learnable power
-        w_raw = (divergence + 1e-8).pow(self.beta)  # (batch_size, seq_len)
+        w_raw = divergence.pow(self.beta)  # (batch_size, seq_len)
         
         # Mask and normalize per sequence
         w_masked = w_raw * response_mask
@@ -141,7 +162,7 @@ class TISWeightModule(nn.Module):
         W = w_masked / seq_sums * seq_lens
         
         # Clip for stability
-        W = W.clamp(self.config.clip_min, self.config.clip_max) * response_mask
+        W = W.clamp(self.config.wt_clip_min, self.config.wt_clip_max) * response_mask
         
         # KL divergence metrics
         kl_term = torch.exp(ref_log_probs) * (ref_log_probs - log_probs) * response_mask

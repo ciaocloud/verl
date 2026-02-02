@@ -585,29 +585,18 @@ class MegatronPPOActor(BasePPOActor):
                 )
                 stats.update(pg_metrics)
                                 
-                # Log correlations with advantage
+                # Accumulate data for correlation metrics (computed once at end of update_policy)
                 if phi_weights is not None or tis_weights is not None:
                     seq_len = response_mask.sum(dim=1).float()
-                    seq_adv = (advantages * response_mask).sum(dim=1) # Proxy for return
-                    
-                    if seq_len.shape[0] > 1:
-                        # 1. Length vs Advantage
-                        corr_len = torch.corrcoef(torch.stack([seq_len, seq_adv]))[0, 1].item()
-                        stats["lotis/corr_len_adv"] = corr_len
-                        
-                        # 2. Phi Weight vs Advantage
-                        if phi_weights is not None:
-                            corr_phi = torch.corrcoef(torch.stack([phi_weights.detach(), seq_adv]))[0, 1].item()
-                            stats["lotis/corr_phi_adv"] = corr_phi
-                            
-                    # 3. TIS Weight (token-level) vs Advantage
+                    seq_adv = (advantages * response_mask).sum(dim=1)
+                    self._corr_seq_lens.append(seq_len.detach())
+                    self._corr_seq_advs.append(seq_adv.detach())
+                    if phi_weights is not None:
+                        self._corr_phi_weights.append(phi_weights.detach())
                     if tis_weights is not None:
                         mask_bool = response_mask.bool()
-                        flat_tis = tis_weights.detach()[mask_bool]
-                        flat_adv = advantages[mask_bool]
-                        if flat_tis.numel() > 1:
-                            corr_tis = torch.corrcoef(torch.stack([flat_tis, flat_adv]))[0, 1].item()
-                            stats["lotis/corr_tis_adv"] = corr_tis
+                        self._corr_tis_flat.append(tis_weights.detach()[mask_bool])
+                        self._corr_adv_flat.append(advantages.detach()[mask_bool])
                 
                 # Log LOTIS grad norm ratio (moved to mini-batch level)
 
@@ -860,6 +849,13 @@ class MegatronPPOActor(BasePPOActor):
 
         """
         metrics = {}
+        
+        # Initialize accumulators for correlation metrics (computed once at end)
+        self._corr_seq_lens = []
+        self._corr_seq_advs = []
+        self._corr_phi_weights = []
+        self._corr_tis_flat = []
+        self._corr_adv_flat = []
         for data in dataloader:
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
@@ -932,6 +928,36 @@ class MegatronPPOActor(BasePPOActor):
         if self.lotis_optimizer is not None:
             self.lotis_optimizer.zero_grad()
 
+        # Compute correlation metrics once from accumulated data
+        if self._corr_seq_lens:
+            all_seq_len = torch.cat(self._corr_seq_lens)
+            all_seq_adv = torch.cat(self._corr_seq_advs)
+            if all_seq_len.numel() > 1:
+                if all_seq_len.std() > 1e-6 and all_seq_adv.std() > 1e-6:
+                    metrics["lotis/corr_len_adv"] = torch.corrcoef(
+                        torch.stack([all_seq_len, all_seq_adv])
+                    )[0, 1].item()
+                else:
+                    metrics["lotis/corr_len_adv"] = 0.0
+            if self._corr_phi_weights:
+                all_phi = torch.cat(self._corr_phi_weights)
+                if all_phi.std() > 1e-6 and all_seq_adv.std() > 1e-6:
+                    metrics["lotis/corr_phi_adv"] = torch.corrcoef(
+                        torch.stack([all_phi, all_seq_adv])
+                    )[0, 1].item()
+                else:
+                    metrics["lotis/corr_phi_adv"] = 0.0
+            if self._corr_tis_flat:
+                all_tis = torch.cat(self._corr_tis_flat)
+                all_adv = torch.cat(self._corr_adv_flat)
+                if all_tis.numel() > 1:
+                    if all_tis.std() > 1e-6 and all_adv.std() > 1e-6:
+                        metrics["lotis/corr_tis_adv"] = torch.corrcoef(
+                            torch.stack([all_tis, all_adv])
+                        )[0, 1].item()
+                    else:
+                        metrics["lotis/corr_tis_adv"] = 0.0
+        
         self.actor_optimizer.zero_grad()
         get_torch_device().empty_cache()
         return metrics

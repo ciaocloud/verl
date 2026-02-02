@@ -29,9 +29,9 @@ class TISWeightConfig(BaseConfig):
     When disabled, falls back to uniform token weighting.
     """
     enable: bool = False
-    beta_init: float = 0.1 
-    beta_lr: float = 0.001
-    beta_max: float = 3.0
+    gamma_init: float = 0.1 
+    gamma_lr: float = 0.001
+    gamma_max: float = 3.0
     wt_clip_min: float = 0.2
     wt_clip_max: float = 5.0
     div_clip: float = 2.0

@@ -130,11 +130,11 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                 lotis_params.append({
                     "params": self.lotis_tis.parameters(),
-                    "lr": lotis_config.tis_weight.beta_lr,
+                    "lr": lotis_config.tis_weight.gamma_lr,
                     "weight_decay": 0.0,
                 })
                 if torch.distributed.get_rank() == 0:
-                    print(f"LOTIS: tis module enabled (DDP), beta_init={lotis_config.tis_weight.beta_init}")
+                    print(f"LOTIS: tis module enabled (DDP), gamma_init={lotis_config.tis_weight.gamma_init}")
             
             # Add LOTIS params to actor optimizer
             for group in lotis_params:

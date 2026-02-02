@@ -216,11 +216,11 @@ class MegatronPPOActor(BasePPOActor):
                     )
                 lotis_params.append({
                     "params": self.lotis_tis.parameters(),
-                    "lr": lotis_config.tis_weight.beta_lr,
+                    "lr": lotis_config.tis_weight.gamma_lr,
                     "weight_decay": 0.0,
                 })
                 if mpu.get_data_parallel_rank() == 0:
-                    print(f"LOTIS: tis module enabled (DDP), beta_init={lotis_config.tis_weight.beta_init}")
+                    print(f"LOTIS: tis module enabled (DDP), gamma_init={lotis_config.tis_weight.gamma_init}")
             
             if lotis_params:
                 # Separate optimizer for LOTIS (Megatron uses DistributedOptimizer)

@@ -48,19 +48,23 @@ actor_rollout_ref:
 | `num_rbf_kernels` | `5` | Number of kernels |
 | `alpha_init` | `0.0` | Initial values (0 = standard GRPO) |
 | `alpha_lr` | `0.01` | Learning rate |
-| `clip_min/max` | `0.1/10.0` | Weight bounds |
+| `wt_clip_min` | `0.2` | Weight lower bound |
+| `wt_clip_max` | `5.0` | Weight upper bound |
 
 **TIS Weight**
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `enable` | `False` | Enable |
-| `beta_init` | `1.0` | Initial beta |
-| `beta_lr` | `0.01` | Learning rate |
-| `clip_min/max` | `0.1/10.0` | Weight bounds |
+| `gamma_init` | `1.0` | Initial gamma |
+| `gamma_lr` | `0.01` | Learning rate |
+| `gamma_max` | `3.0` | Max gamma (soft cap) |
+| `wt_clip_min` | `0.2` | Weight lower bound |
+| `wt_clip_max` | `5.0` | Weight upper bound |
+| `div_clip` | `2.0` | Divergence clamp bound |
 
 ## Metrics
 
 - `lotis/rbf_alphas_mean`: RBF alpha params
-- `lotis/tis_beta`: TIS beta param
+- `lotis/tis_gamma`: TIS gamma param
 - `lotis/rbf_phi_mean`: Sequence weight mean
 - `lotis/tis_weight_mean`: Token weight mean

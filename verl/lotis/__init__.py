@@ -11,8 +11,8 @@ Actor-based implementation with DDP sync. Configure in YAML:
             alpha_lr: 0.01
           tis_weight:
             enable: true
-            beta_init: 1.0
-            beta_lr: 0.01
+            gamma_init: 1.0
+            gamma_lr: 0.01
 Note: For TIS, ref_log_prob must be in batch (from reference model).
       The actor auto-includes it when TIS is enabled.
 """

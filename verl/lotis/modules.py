@@ -86,7 +86,7 @@ class RBFLengthWeightModule(nn.Module):
 class TISWeightModule(nn.Module):
     """Computes token-level importance weights based on policy divergence.
     
-    w_t = |log pi_theta - log pi_ref|^beta
+    w_t = |log pi_theta - log pi_ref|^gamma
     Output is normalized per sequence to preserve gradient energy.
     """
 
@@ -94,13 +94,13 @@ class TISWeightModule(nn.Module):
         super().__init__()
         self.config = config
         
-        # Learnable beta via softplus to ensure > 0
-        self._beta_raw = nn.Parameter(torch.tensor(0.0))
-        self._init_beta(config.beta_init)
+        # Learnable gamma via softplus to ensure > 0
+        self._gamma_raw = nn.Parameter(torch.tensor(0.0))
+        self._init_gamma(config.gamma_init)
 
-    def _init_beta(self, target: float):
-        """Initialize beta_raw so beta_max * tanh(softplus(beta_raw)) = target."""
-        max_val = getattr(self.config, "beta_max", 3.0)
+    def _init_gamma(self, target: float):
+        """Initialize gamma_raw so gamma_max * tanh(softplus(gamma_raw)) = target."""
+        max_val = getattr(self.config, "gamma_max", 3.0)
         # Clamp target to valid range (0, max_val)
         target = max(1e-6, min(max_val - 1e-6, target))
         # y = arctanh(target / max_val)
@@ -109,18 +109,18 @@ class TISWeightModule(nn.Module):
         y = 0.5 * math.log((1 + ratio) / (1 - ratio))
         # x = inv_softplus(y)
         if y > 20:
-            self._beta_raw.data.fill_(y)
+            self._gamma_raw.data.fill_(y)
         else:
             val = math.exp(y) - 1
             val = max(1e-6, val)
-            self._beta_raw.data.fill_(math.log(val))
+            self._gamma_raw.data.fill_(math.log(val))
 
     @property
-    def beta(self) -> torch.Tensor:
-        # Bounded beta: beta_max * tanh(softplus(beta_raw))
+    def gamma(self) -> torch.Tensor:
+        # Bounded gamma: gamma_max * tanh(softplus(gamma_raw))
         # Prevents sparsity collapse, ensuring credit assignment to "scaffolding" tokens
-        max_val = getattr(self.config, "beta_max", 3.0)
-        return max_val * torch.tanh(F.softplus(self._beta_raw))
+        max_val = getattr(self.config, "gamma_max", 3.0)
+        return max_val * torch.tanh(F.softplus(self._gamma_raw))
 
     def forward(
         self,
@@ -151,7 +151,7 @@ class TISWeightModule(nn.Module):
             divergence = divergence.clamp(min=1e-6)
         
         # Apply learnable power
-        w_raw = divergence.pow(self.beta)  # (batch_size, seq_len)
+        w_raw = divergence.pow(self.gamma)  # (batch_size, seq_len)
         
         # Mask and normalize per sequence
         w_masked = w_raw * response_mask
@@ -174,7 +174,7 @@ class TISWeightModule(nn.Module):
 
         w_valid = W[response_mask.bool()]
         metrics = {
-            "lotis/tis_beta": self.beta.item(),
+            "lotis/tis_gamma": self.gamma.item(),
             "lotis/tis_weight_mean": w_valid.mean().item(),
             "lotis/tis_weight_std": w_valid.std().item(),
             "lotis/tis_weight_max": w_valid.max().item(),

@@ -8,17 +8,17 @@ Actor-based implementation with DDP sync. Configure in YAML:
           length_weight:
             enable: true
             num_rbf_kernels: 5
-            alpha_lr: 0.01
-          tis_weight:
+            lr: 0.01
+          token_weight:
             enable: true
-            gamma_init: 1.0
-            gamma_lr: 0.01
+            lr: 0.01
+            mode: "divergence" # or "mlp"
 Note: For TIS, ref_log_prob must be in batch (from reference model).
       The actor auto-includes it when TIS is enabled.
 """
 
-from verl.lotis.config import LOTISConfig, LengthWeightConfig, TISWeightConfig
-from verl.lotis.modules import RBFLengthWeightModule, TISWeightModule
+from verl.lotis.config import LOTISConfig, LengthWeightConfig, TokenWeightConfig
+from verl.lotis.modules import RBFLengthWeightModule, KLTokenWeightModule, MLPTokenWeightModule
 # Note: compute_lotis_policy_loss is NOT imported here to avoid circular imports with verl.workers.config. 
 # It must be imported where needed (e.g. in actors) to ensure registration.
 
@@ -26,8 +26,9 @@ __all__ = [
     # Config
     "LOTISConfig",
     "LengthWeightConfig",
-    "TISWeightConfig",
+    "TokenWeightConfig",
     # Modules
     "RBFLengthWeightModule",
-    "TISWeightModule",
+    "KLTokenWeightModule",
+    "MLPTokenWeightModule",
 ]

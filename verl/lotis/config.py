@@ -17,23 +17,32 @@ class LengthWeightConfig(BaseConfig):
     rbf_centers: Optional[List[float]] = None  # None = auto linspace(-2, 2, K)
     rbf_bandwidth: float = 1.0
     alpha_init: float = 0.0  # 0 means phi=1 at init (standard GRPO)
-    alpha_lr: float = 0.001
+    lr: float = 0.001
+    weight_decay: float = 1e-4
     phi_clip_min: float = 0.2
     phi_clip_max: float = 5.0
 
 
 @dataclass
-class TISWeightConfig(BaseConfig):
+class TokenWeightConfig(BaseConfig):
     """Config for Token Importance Sampling weighting.
     
     When disabled, falls back to uniform token weighting.
     """
     enable: bool = False
+    
+    # MLP Config (used when mode="mlp")
+    mode: str = "mlp"  # "kl" (divergence) or "mlp"
+    mlp_hidden_dim: int = 256
+    mlp_num_layers: int = 2
+    mlp_activation: str = "silu"
+    psi_clip_min: float = 0.2
+    psi_clip_max: float = 5.0
+    
     gamma_init: float = 0.1 
-    gamma_lr: float = 0.001
+    lr: float = 0.001
+    weight_decay: float = 1e-4
     gamma_max: float = 3.0
-    wt_clip_min: float = 0.2
-    wt_clip_max: float = 5.0
     div_clip: float = 2.0
 
 
@@ -41,9 +50,9 @@ class TISWeightConfig(BaseConfig):
 class LOTISConfig(BaseConfig):
     """Main LOTIS configuration combining length and TIS weighting."""
     length_weight: LengthWeightConfig = field(default_factory=LengthWeightConfig)
-    tis_weight: TISWeightConfig = field(default_factory=TISWeightConfig)
+    token_weight: TokenWeightConfig = field(default_factory=TokenWeightConfig)
 
     @property
     def is_enabled(self) -> bool:
         """Returns True if any LOTIS component is enabled."""
-        return self.length_weight.enable or self.tis_weight.enable
+        return self.length_weight.enable or self.token_weight.enable

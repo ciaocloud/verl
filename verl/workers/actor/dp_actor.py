@@ -100,41 +100,56 @@ class DataParallelPPOActor(BasePPOActor):
 
         # LOTIS modules (learnable sequence/token weighting)
         # Wrapped in DDP to sync across actor workers
-        self.lotis_phi = None
-        self.lotis_tis = None
+        self.lotis_length_module = None
+        self.lotis_token_module = None
+        self.need_hidden_states = False
+        self.need_ref_log_prob = False
+
         lotis_config = self.config.get("lotis", None)
         if lotis_config is not None and actor_optimizer is not None:
-            from verl.lotis.modules import RBFLengthWeightModule, TISWeightModule
+            from verl.lotis.modules import RBFLengthWeightModule, KLTokenWeightModule, MLPTokenWeightModule
             
             lotis_params = []
             if getattr(lotis_config.length_weight, "enable", False):
-                self.lotis_phi = RBFLengthWeightModule(lotis_config.length_weight).to(get_device_id())
+                self.lotis_length_module = RBFLengthWeightModule(lotis_config.length_weight).to(get_device_id())
                 # Wrap in DDP for gradient sync across workers
                 if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-                    self.lotis_phi = torch.nn.parallel.DistributedDataParallel(
-                        self.lotis_phi, device_ids=[get_device_id()]
+                    self.lotis_length_module = torch.nn.parallel.DistributedDataParallel(
+                        self.lotis_length_module, device_ids=[get_device_id()]
                     )
                 lotis_params.append({
-                    "params": self.lotis_phi.parameters(),
-                    "lr": lotis_config.length_weight.alpha_lr,
+                    "params": self.lotis_length_module.parameters(),
+                    "lr": lotis_config.length_weight.lr,
                     "weight_decay": 0.0,
                 })
                 if torch.distributed.get_rank() == 0:
                     print(f"LOTIS: phi module enabled (DDP), K={lotis_config.length_weight.num_rbf_kernels}")
             
-            if getattr(lotis_config.tis_weight, "enable", False):
-                self.lotis_tis = TISWeightModule(lotis_config.tis_weight).to(get_device_id())
+            if getattr(lotis_config.token_weight, "enable", False):
+                if lotis_config.token_weight.mode == "mlp":
+                    # Determine hidden dim from actor config
+                    actor_config = getattr(self.actor_module, "config", getattr(self.actor_module, "module", self.actor_module).config)
+                    hidden_dim = actor_config.hidden_size
+                    self.lotis_token_module = MLPTokenWeightModule(lotis_config.token_weight, hidden_dim).to(get_device_id())
+                    self.need_hidden_states = True
+                    if torch.distributed.get_rank() == 0:
+                        print(f"LOTIS: token weight module enabled (MLP), hidden_dim={hidden_dim}. Extraction of hidden states enabled.")
+                elif lotis_config.token_weight.mode == "kl":
+                    self.lotis_token_module = KLTokenWeightModule(lotis_config.token_weight).to(get_device_id())
+                    self.need_ref_log_prob = True
+                    if torch.distributed.get_rank() == 0:
+                        print(f"LOTIS: token weight module enabled (KL Divergence), gamma_init={lotis_config.token_weight.gamma_init}. Need ref_log_prob.")
+                
                 if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-                    self.lotis_tis = torch.nn.parallel.DistributedDataParallel(
-                        self.lotis_tis, device_ids=[get_device_id()]
+                    self.lotis_token_module = torch.nn.parallel.DistributedDataParallel(
+                        self.lotis_token_module, device_ids=[get_device_id()]
                     )
                 lotis_params.append({
-                    "params": self.lotis_tis.parameters(),
-                    "lr": lotis_config.tis_weight.gamma_lr,
-                    "weight_decay": 0.0,
+                    "params": self.lotis_token_module.parameters(),
+                    "lr": lotis_config.token_weight.lr,
+                    "lr": lotis_config.token_weight.lr,
+                    "weight_decay": lotis_config.token_weight.weight_decay,
                 })
-                if torch.distributed.get_rank() == 0:
-                    print(f"LOTIS: tis module enabled (DDP), gamma_init={lotis_config.tis_weight.gamma_init}")
             
             # Add LOTIS params to actor optimizer
             for group in lotis_params:
@@ -290,15 +305,24 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
                     use_cache=False,
+                    output_hidden_states=self.need_hidden_states,
                     **extra_args,
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
+                    if self.need_hidden_states:
+                         # Fused kernels might not return hidden states easily or might need update
+                         # For now assume output has hidden_states if requested
+                         # output.hidden_states is usually a tuple, take the last one
+                         hidden_states_rmpad = output.hidden_states[-1].squeeze(0) # (total_nnz, hidden_dim)
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                    if self.need_hidden_states:
+                        hidden_states_rmpad = output.hidden_states[-1].squeeze(0) # (total_nnz, hidden_dim)
+                    
                     logits_rmpad.div_(temperature)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
@@ -350,11 +374,17 @@ class DataParallelPPOActor(BasePPOActor):
                         sum_pi_squared_rmpad = gather_outputs_and_unpad(
                             sum_pi_squared_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
                         )
+                    if self.need_hidden_states:
+                        hidden_states_rmpad = gather_outputs_and_unpad(
+                            hidden_states_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                        )
 
                 if is_mask_all_zero:
                     log_probs = log_probs[:0]
                     if calculate_entropy:
                         entropy_rmpad = entropy_rmpad[:0]
+                    if self.need_hidden_states:
+                        hidden_states_rmpad = hidden_states_rmpad[:0]
 
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
@@ -367,6 +397,13 @@ class DataParallelPPOActor(BasePPOActor):
                 if calculate_sum_pi_squared:
                     full_sum_pi_squared = pad_input(
                         hidden_states=sum_pi_squared_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                if self.need_hidden_states:
+                    full_hidden_states = pad_input(
+                        hidden_states=hidden_states_rmpad,
                         indices=indices,
                         batch=batch_size,
                         seqlen=seqlen,
@@ -384,6 +421,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if calculate_sum_pi_squared:
                     # (bsz, response_length)
                     sum_pi_squared = full_sum_pi_squared.squeeze(-1)[:, -response_length - 1 : -1]
+                if self.need_hidden_states:
+                    hidden_states = full_hidden_states[:, -response_length - 1 : -1]
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
@@ -398,15 +437,20 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids,
                     **multi_modal_inputs,
                     use_cache=False,
+                    output_hidden_states=self.need_hidden_states,
                     **extra_args,
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    if self.need_hidden_states:
+                        hidden_states = output.hidden_states[-1][:, -response_length - 1 : -1]
 
                 else:
                     logits = output.logits
+                    if self.need_hidden_states:
+                        hidden_states = output.hidden_states[-1][:, -response_length - 1 : -1]
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
@@ -429,6 +473,8 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
+            if self.need_hidden_states:
+                outputs["hidden_states"] = hidden_states
             return outputs
 
     def _optimizer_step(self):
@@ -560,8 +606,7 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.use_prefix_grouper and "prompts" in data.batch.keys():
             select_keys.append("prompts")
-        # Include ref_log_prob for KL loss or LOTIS TIS
-        if self.config.use_kl_loss or self.lotis_tis is not None or "ref_log_prob" in data.batch.keys():
+        if self.config.use_kl_loss or self.need_ref_log_prob:
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
@@ -595,8 +640,7 @@ class DataParallelPPOActor(BasePPOActor):
         corr_seq_lens = []
         corr_seq_advs = []
         corr_phi_weights = []
-        corr_tis_flat = []
-        corr_adv_flat = []
+        corr_seq_mean_token_weights = []
         
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
@@ -635,6 +679,7 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
+                    hidden_states = outputs["hidden_states"] if self.need_hidden_states else None
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -654,16 +699,22 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # Compute LOTIS weights locally (DDP syncs gradients)
                     phi_weights = None
-                    tis_weights = None
-                    if self.lotis_phi is not None:
-                        phi_weights, phi_metrics = self.lotis_phi(response_mask)
+                    token_weights = None
+                    if self.lotis_length_module is not None:
+                        phi_weights, phi_metrics = self.lotis_length_module(response_mask)
                         micro_batch_metrics.update(phi_metrics)
-                    ref_log_prob = model_inputs.get("ref_log_prob", None)
-                    if self.lotis_tis is not None and ref_log_prob is not None:
-                        tis_weights, tis_metrics = self.lotis_tis(log_prob, ref_log_prob, response_mask)
-                        micro_batch_metrics.update(tis_metrics)
+                    
+                    if self.lotis_token_module is not None:
+                        if self.need_hidden_states and hidden_states is not None:
+                            token_weights, tis_metrics = self.lotis_token_module(hidden_states, response_mask)
+                            micro_batch_metrics.update(tis_metrics)
+                        elif self.need_ref_log_prob:
+                            ref_log_prob = model_inputs.get("ref_log_prob", None)
+                            if ref_log_prob is not None:
+                                token_weights, tis_metrics = self.lotis_token_module(log_prob, ref_log_prob, response_mask)
+                                micro_batch_metrics.update(tis_metrics)
                     # Auto-switch to lotis loss mode if weights computed
-                    if phi_weights is not None or tis_weights is not None:
+                    if phi_weights is not None or token_weights is not None:
                         loss_mode = "lotis"
 
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
@@ -674,7 +725,7 @@ class DataParallelPPOActor(BasePPOActor):
                     lotis_kwargs = {}
                     if loss_mode == "lotis":
                         lotis_kwargs["phi_weights"] = phi_weights
-                        lotis_kwargs["tis_weights"] = tis_weights
+                        lotis_kwargs["token_weights"] = token_weights
 
                     # Compute policy loss (any function is expected to return 2 values)
                     pg_loss, pg_metrics = policy_loss_fn(
@@ -690,17 +741,19 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics.update(pg_metrics)
                     
                     # Accumulate data for correlation metrics (computed once at end)
-                    if phi_weights is not None or tis_weights is not None:
+                    if phi_weights is not None or token_weights is not None:
                         seq_len = response_mask.sum(dim=1).float()
-                        seq_adv = (advantages * response_mask).sum(dim=1)
-                        corr_seq_lens.append(seq_len.detach())
-                        corr_seq_advs.append(seq_adv.detach())
+                        seq_adv = (advantages.detach() * response_mask).sum(dim=1)
+                        corr_seq_lens.append(seq_len)
+                        corr_seq_advs.append(seq_adv)
                         if phi_weights is not None:
                             corr_phi_weights.append(phi_weights.detach())
-                        if tis_weights is not None:
-                            mask_bool = response_mask.bool()
-                            corr_tis_flat.append(tis_weights.detach()[mask_bool])
-                            corr_adv_flat.append(advantages.detach()[mask_bool])
+                        if token_weights is not None:
+                            # Mean token weight per sequence
+                            # token_weights: [bsz, len], response_mask: [bsz, len]
+                            seq_sum_weights = (token_weights.detach() * response_mask).sum(dim=1)
+                            seq_mean_token_weights = seq_sum_weights / (seq_len + 1e-6)
+                            corr_seq_mean_token_weights.append(seq_mean_token_weights)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
@@ -752,14 +805,14 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
 
                 # Log LOTIS grad norm ratio (lotis_grad_norm / grad_norm)
-                if self.lotis_phi is not None or self.lotis_tis is not None:
+                if self.lotis_length_module is not None or self.lotis_token_module is not None:
                     lotis_grad_norm = 0.0
-                    if self.lotis_phi is not None:
-                        for p in self.lotis_phi.parameters():
+                    if self.lotis_length_module is not None:
+                        for p in self.lotis_length_module.parameters():
                             if p.grad is not None:
                                 lotis_grad_norm += p.grad.detach().data.norm(2).item() ** 2
-                    if self.lotis_tis is not None:
-                        for p in self.lotis_tis.parameters():
+                    if self.lotis_token_module is not None:
+                        for p in self.lotis_token_module.parameters():
                             if p.grad is not None:
                                 lotis_grad_norm += p.grad.detach().data.norm(2).item() ** 2
                     lotis_grad_norm = lotis_grad_norm ** 0.5
@@ -787,16 +840,16 @@ class DataParallelPPOActor(BasePPOActor):
                     )[0, 1].item()
                 else:
                     metrics["lotis/corr_phi_adv"] = 0.0
-            if corr_tis_flat:
-                all_tis = torch.cat(corr_tis_flat)
-                all_adv = torch.cat(corr_adv_flat)
+            if corr_seq_mean_token_weights:
+                all_tis = torch.cat(corr_seq_mean_token_weights)
+                all_seq_adv = torch.cat(corr_seq_advs)
                 if all_tis.numel() > 1:
-                    if all_tis.std() > 1e-6 and all_adv.std() > 1e-6:
-                        metrics["lotis/corr_tis_adv"] = torch.corrcoef(
-                            torch.stack([all_tis, all_adv])
+                    if all_tis.std() > 1e-6 and all_seq_adv.std() > 1e-6:
+                        metrics["lotis/corr_seq_tis_adv"] = torch.corrcoef(
+                            torch.stack([all_tis, all_seq_adv])
                         )[0, 1].item()
                     else:
-                        metrics["lotis/corr_tis_adv"] = 0.0
+                        metrics["lotis/corr_seq_tis_adv"] = 0.0
         
         self.actor_optimizer.zero_grad()
         return metrics

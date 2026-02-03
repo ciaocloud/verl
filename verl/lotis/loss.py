@@ -17,7 +17,7 @@ def compute_lotis_policy_loss(
     config=None,
     # LOTIS weights (computed by actor's lotis module)
     phi_weights: Optional[torch.Tensor] = None,
-    tis_weights: Optional[torch.Tensor] = None,
+    token_weights: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, Dict[str, Any]]:
     """Compute LOTIS policy loss with sequence and token weighting.
@@ -30,7 +30,7 @@ def compute_lotis_policy_loss(
         loss_agg_mode: aggregation mode (used when phi_weights is None)
         config: actor config with clip_ratio settings
         phi_weights: (batch_size,) sequence-level weights from RBF module
-        tis_weights: (batch_size, seq_len) token-level weights from TIS module
+        token_weights: (batch_size, seq_len) token-level weights from TIS module
         
     Returns:
         pg_loss: scalar policy gradient loss
@@ -47,8 +47,8 @@ def compute_lotis_policy_loss(
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     
     # Apply TIS weights to ratio if provided
-    if tis_weights is not None:
-        weighted_ratio = ratio * tis_weights
+    if token_weights is not None:
+        weighted_ratio = ratio * token_weights
         clipped_ratio = torch.clamp(weighted_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
     else:
         weighted_ratio = ratio

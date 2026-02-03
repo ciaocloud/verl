@@ -264,16 +264,22 @@ lotis:
     rbf_centers: null
     rbf_bandwidth: 1.0
     alpha_init: 0.0
-    alpha_lr: 0.001
+    lr: 0.001
     phi_clip_min: 0.2
     phi_clip_max: 5.0
 
-  tis_weight:
-    _target_: verl.lotis.config.TISWeightConfig
+  token_weight:
+    _target_: verl.lotis.config.TokenWeightConfig
     enable: false
+    mode: "mlp"  # "kl" (divergence) or "mlp"
+    mlp_hidden_dim: 256
+    mlp_num_layers: 1
+    mlp_activation: "silu"
+    psi_clip_min: 0.2
+    psi_clip_max: 5.0
+    lr: 0.01
+    weight_decay: 0.0001
+
     gamma_init: 0.1
-    gamma_lr: 0.001
     gamma_max: 3.0
-    wt_clip_min: 0.2
-    wt_clip_max: 5.0
     div_clip: 2.0

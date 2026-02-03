@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from verl.lotis.config import LengthWeightConfig, TISWeightConfig
+from verl.lotis.config import LengthWeightConfig, TokenWeightConfig
 
 
 class RBFLengthWeightModule(nn.Module):
@@ -83,14 +83,14 @@ class RBFLengthWeightModule(nn.Module):
         return phi, metrics
 
 
-class TISWeightModule(nn.Module):
-    """Computes token-level importance weights based on policy divergence.
+class KLTokenWeightModule(nn.Module):
+    """Token weighting based on KL divergence between policy and reference model.
     
     w_t = |log pi_theta - log pi_ref|^gamma
     Output is normalized per sequence to preserve gradient energy.
     """
 
-    def __init__(self, config: TISWeightConfig):
+    def __init__(self, config: TokenWeightConfig):
         super().__init__()
         self.config = config
         
@@ -162,7 +162,7 @@ class TISWeightModule(nn.Module):
         W = w_masked / seq_sums * seq_lens
         
         # Clip for stability
-        W = W.clamp(self.config.wt_clip_min, self.config.wt_clip_max) * response_mask
+        W = W.clamp(self.config.psi_clip_min, self.config.psi_clip_max) * response_mask
         
         # KL divergence metrics
         kl_term = torch.exp(ref_log_probs) * (ref_log_probs - log_probs) * response_mask
@@ -185,3 +185,104 @@ class TISWeightModule(nn.Module):
         }
         
         return W, metrics
+
+class MLPTokenWeightModule(nn.Module):
+    """Computes token-level importance weights based on MLP over hidden states.
+    
+    psi_t = MLP(h_t)
+    Output is normalized per sequence to preserve gradient energy.
+    Symbol: psi (ψ)
+    """
+    
+    def __init__(self, config: TokenWeightConfig, hidden_dim: int):
+        super().__init__()
+        self.config = config
+        
+        layers = []
+        in_dim = hidden_dim
+        
+        activation_map = {
+            "relu": nn.ReLU,
+            "gelu": nn.GELU,
+            "tanh": nn.Tanh,
+            "sigmoid": nn.Sigmoid,
+            "silu": nn.SiLU,
+            "swish": nn.SiLU,
+        }
+        act_cls = activation_map.get(config.mlp_activation.lower(), nn.SiLU)
+        
+        # Pre-norm
+        layers.append(nn.LayerNorm(hidden_dim))
+
+        for _ in range(config.mlp_num_layers):
+            layers.append(nn.Linear(in_dim, config.mlp_hidden_dim))
+            layers.append(act_cls())
+            in_dim = config.mlp_hidden_dim
+            
+        # Final projection to scalar weight (raw)
+        layers.append(nn.Linear(in_dim, 1))
+        # Ensure positive weights
+        layers.append(nn.Softplus())
+        
+        self.mlp = nn.Sequential(*layers)
+        
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize MLP weights for stable starting point."""
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # The last layer is at index -2 (before Softplus)
+        last_linear = self.mlp[-2]
+        nn.init.normal_(last_linear.weight, mean=0.0, std=0.001)
+        # Softplus(0.5413) ≈ 1.0. This makes raw weights start at 1.0.
+        nn.init.constant_(last_linear.bias, 0.5413)
+        
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute TIS weights from hidden states.
+        
+        Args:
+            hidden_states: (batch_size, seq_len, hidden_dim) last layer hidden states
+            response_mask: (batch_size, seq_len) binary mask
+            
+        Returns:
+            W: (batch_size, seq_len) weights normalized per sequence
+            metrics: dict of metrics
+        """
+        # Detach hidden states to prevent gradient flow to actor backbone
+        # Cast to MLP's dtype (e.g., float32) to match LayerNorm parameters
+        # (batch_size, seq_len, 1) -> (batch, seq_len)
+        mlp_dtype = next(self.mlp.parameters()).dtype
+        w_raw = self.mlp(hidden_states.detach().to(mlp_dtype)).squeeze(-1)
+        
+        # Mask and normalize per sequence
+        w_masked = w_raw * response_mask
+        seq_sums = w_masked.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        seq_lens = response_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+        
+        # Normalize so each sequence sums to its length (preserves gradient energy)
+        psi = w_masked / seq_sums * seq_lens
+        
+        # Clip for stability
+        psi = psi.clamp(self.config.psi_clip_min, self.config.psi_clip_max) * response_mask
+        
+        psi_valid = psi[response_mask.bool()]
+        metrics = {
+            "lotis/psi_weight_mean": psi_valid.mean().item(),
+            "lotis/psi_weight_std": psi_valid.std().item(),
+            "lotis/psi_weight_max": psi_valid.max().item(),
+            "lotis/psi_weight_min": psi_valid.min().item(),
+            "lotis/psi_raw_mlp_mean": w_masked[response_mask.bool()].mean().item(),
+        }
+        
+        # Cast back to input dtype for consistency with other tensors in loss
+        return psi.to(response_mask.dtype), metrics

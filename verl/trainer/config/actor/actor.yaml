@@ -280,6 +280,18 @@ lotis:
     lr: 0.01
     weight_decay: 0.0001
 
+    # MLP Input Features (only applies when mode="mlp")
+    # Each scalar feature is projected to scalar_embed_dim before concat
+    scalar_embed_dim: 16
+    use_hidden_state: true       # h_t vector: "What am I saying?"
+    use_log_prob: true           # Confidence: "Am I sure?"
+    use_entropy: true            # Uncertainty: "Did I struggle?"
+    use_kl_divergence: true      # Novelty: "Is this new?"
+    use_relative_position: true  # Timing: "Intro or conclusion?"
+    use_semantic_drift: true     # Focus: "Are we still on topic?"
+    use_local_ppl: true          # Smoothed PPL: "Hard reasoning block?"
+
+    # KL mode parameters (only applies when mode="kl")
     gamma_init: 0.1
     gamma_max: 3.0
     div_clip: 2.0

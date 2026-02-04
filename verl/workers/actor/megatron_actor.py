@@ -190,6 +190,7 @@ class MegatronPPOActor(BasePPOActor):
         self.lotis_optimizer = None
         self.need_hidden_states = False
         self.need_ref_log_prob = False
+        self.need_entropy = False
 
         lotis_config = self.config.get("lotis", None)
         if lotis_config is not None:
@@ -216,8 +217,22 @@ class MegatronPPOActor(BasePPOActor):
                     hidden_dim = self.model_config.hidden_size
                     self.lotis_token_module = MLPTokenWeightModule(lotis_config.token_weight, hidden_dim).to(get_device_id())
                     self.need_hidden_states = True
+                    # Need ref_log_prob for KL divergence feature
+                    if lotis_config.token_weight.use_kl_divergence:
+                        self.need_ref_log_prob = True
+                    # Need entropy for entropy feature
+                    if lotis_config.token_weight.use_entropy:
+                        self.need_entropy = True
                     if mpu.get_data_parallel_rank() == 0:
-                        print(f"LOTIS: token weight module enabled (MLP), hidden_dim={hidden_dim}. Extraction of hidden states enabled.")
+                        features_enabled = []
+                        if lotis_config.token_weight.use_hidden_state: features_enabled.append("hidden")
+                        if lotis_config.token_weight.use_log_prob: features_enabled.append("logprob")
+                        if lotis_config.token_weight.use_entropy: features_enabled.append("entropy")
+                        if lotis_config.token_weight.use_kl_divergence: features_enabled.append("kl")
+                        if lotis_config.token_weight.use_relative_position: features_enabled.append("pos")
+                        if lotis_config.token_weight.use_semantic_drift: features_enabled.append("drift")
+                        if lotis_config.token_weight.use_local_ppl: features_enabled.append("local_ppl")
+                        print(f"LOTIS: token weight module enabled (MLP), features=[{','.join(features_enabled)}], hidden_dim={hidden_dim}")
                 elif lotis_config.token_weight.mode == "kl":
                     self.lotis_token_module = KLTokenWeightModule(lotis_config.token_weight).to(get_device_id())
                     self.need_ref_log_prob = True
@@ -238,35 +253,10 @@ class MegatronPPOActor(BasePPOActor):
             if lotis_params:
                 # Separate optimizer for LOTIS (Megatron uses DistributedOptimizer)
                 self.lotis_optimizer = torch.optim.Adam(lotis_params)
-            self.filler_ids = get_ids(filler_words)
-            if mpu.get_data_parallel_rank() == 0:
-                print(f"LOTIS Semantic Gap: Reasoning IDs: {self.reasoning_ids.tolist()}")
-                print(f"LOTIS Semantic Gap: Filler IDs: {self.filler_ids.tolist()}")
 
         if self.need_hidden_states:
-             self._current_hidden_states = None
-             self._register_hidden_state_hooks()
-                 # We need to find the right module to hook.
-                 # Usually the output layer is in the last chunk of the pipeline.
-                 # And inside that chunk, we want the input to the output layer (final layernorm output)
-                 
-                 # Attempt to find the output layer or hook the whole model's pre_process/post_process
-                 # Since we can't easily introspect Mcore model structure without knowing version,
-                 # we will hook on the PRE-PROCESS of the last stage if possible, or hook on the language_model.
-                 # Wait, if we use hook on the *model* itself, the input to the model is input_ids.
-                 # Use hook on `language_model`?
-                 
-                 # Strategy: Hook `forward` of the underlying Mcore model (unwrapped).
-                 # Wait, Mcore GPTModel forward returns just Tensor (logits).
-                 # If we hook it, we get (logits,) as output.
-                 # We need hidden states.
-                 
-                 # Alternative Strategy: Hook the `output_layer` (linear).
-                 # The input to `output_layer` IS the hidden state.
-                 # We find the output layer.
-                 
-                 self._current_hidden_states = None
-                 self._register_hidden_state_hooks()
+            self._current_hidden_states = None
+            self._register_hidden_state_hooks()
 
     def _register_hidden_state_hooks(self):
         # Only register on the last pipeline stage
@@ -631,22 +621,25 @@ class MegatronPPOActor(BasePPOActor):
                     stats.update(phi_metrics)
                 
                 if self.lotis_token_module is not None:
-                    if hidden_states is not None:
+                    if self.need_hidden_states and hidden_states is not None:
                         # Extract hidden states corresponding to response (similar to log_prob)
-                        # Hidden states shape: [batch, seq_len, dim] or [total_tokens, dim]
-                        # We need to ensure we align with response mask
-                        # Note: log_probs slicing: [:, -response_length - 1 : -1] indicates response tokens
-                        # The hidden states returned usually match the input sequence length.
-                        # We assume the same slicing logic applies.
-                        
-                        # slice hidden states to response
-                        # The input to model was full sequence. 
-                        # log_probs were sliced from full sequence logits.
-                        # IF hidden_states came from the *same* return, they should be full sequence too.
                         response_hidden_states = hidden_states[:, -response_length - 1 : -1].contiguous()
-                        token_weights, tis_metrics = self.lotis_token_module(response_hidden_states, response_mask)
+                        
+                        # Build features dict for MLP token weight module
+                        ref_log_prob = data.get("ref_log_prob", None)
+                        features = {
+                            "hidden_states": response_hidden_states.detach(),
+                            "log_prob": log_prob.detach(),
+                            "entropy": entropy.detach() if entropy is not None else None,
+                            "ref_log_prob": ref_log_prob.detach() if ref_log_prob is not None else None,
+                        }
+                        token_weights, tis_metrics = self.lotis_token_module(features, response_mask)
                         stats.update(tis_metrics)
+                        
+                        # Compute feature importance after backward (in loss_func context, after loss returned)
+                        # Feature importance will be computed separately
                     elif self.need_ref_log_prob:
+                        # KL divergence mode (legacy)
                         ref_log_prob = data.get("ref_log_prob", None)
                         if ref_log_prob is not None:
                             token_weights, tis_metrics = self.lotis_token_module(log_prob, ref_log_prob, response_mask)
@@ -688,8 +681,6 @@ class MegatronPPOActor(BasePPOActor):
                     self._corr_seq_advs.append(seq_adv)
                     if phi_weights is not None:
                         self._corr_phi_weights.append(phi_weights.detach())
-                    if token_weights is not None:
-                        # Mean token weight per sequence
                     if token_weights is not None:
                         # Mean token weight per sequence
                         seq_sum_weights = (token_weights.detach() * response_mask).sum(dim=1)
@@ -968,7 +959,8 @@ class MegatronPPOActor(BasePPOActor):
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
                 chunk.zero_grad_buffer()
 
-            calculate_entropy = self.config.entropy_coeff != 0
+            lotis_needs_entropy = self.need_hidden_states and self.need_entropy
+            calculate_entropy = self.config.entropy_coeff != 0 or lotis_needs_entropy
             if data.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = data.meta_info["micro_batch_size"]
             else:
@@ -1013,23 +1005,39 @@ class MegatronPPOActor(BasePPOActor):
         # Step LOTIS optimizer if enabled
         if self.lotis_optimizer is not None:
             self.lotis_optimizer.step()
+        # Log separate LOTIS grad norms for RBF (phi) and MLP (psi)
         if self.lotis_length_module is not None or self.lotis_token_module is not None:
-            lotis_grad_norm = 0.0
-            if self.lotis_length_module is not None:
-                for p in self.lotis_length_module.parameters():
-                    if p.grad is not None:
-                        lotis_grad_norm += p.grad.detach().data.norm(2).item() ** 2
-            if self.lotis_token_module is not None:
-                for p in self.lotis_token_module.parameters():
-                    if p.grad is not None:
-                        lotis_grad_norm += p.grad.detach().data.norm(2).item() ** 2
-            lotis_grad_norm = lotis_grad_norm ** 0.5                
             # Handle grad_norm being potentially a tensor or float
             grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
-            logit_grad_ratio = {"lotis/grad_ratio": lotis_grad_norm / (grad_norm_val + 1e-6)}
-            append_to_dict(metrics, logit_grad_ratio)
+            
+            # RBF (phi) grad norm
+            if self.lotis_length_module is not None:
+                phi_grad_norm = 0.0
+                for p in self.lotis_length_module.parameters():
+                    if p.grad is not None:
+                        phi_grad_norm += p.grad.detach().data.norm(2).item() ** 2
+                phi_grad_norm = phi_grad_norm ** 0.5
+                metrics["lotis/phi_grad_norm"] = phi_grad_norm
+                metrics["lotis/phi_grad_ratio"] = phi_grad_norm / (grad_norm_val + 1e-6)
+            
+            # MLP (psi) grad norm
+            if self.lotis_token_module is not None:
+                psi_grad_norm = 0.0
+                for p in self.lotis_token_module.parameters():
+                    if p.grad is not None:
+                        psi_grad_norm += p.grad.detach().data.norm(2).item() ** 2
+                psi_grad_norm = psi_grad_norm ** 0.5
+                metrics["lotis/psi_grad_norm"] = psi_grad_norm
+                metrics["lotis/psi_grad_ratio"] = psi_grad_norm / (grad_norm_val + 1e-6)
         if self.lotis_optimizer is not None:
             self.lotis_optimizer.zero_grad()
+        
+        # Compute feature importance for LOTIS MLP (after backward)
+        if self.lotis_token_module is not None and self.need_hidden_states:
+            token_module = getattr(self.lotis_token_module, 'module', self.lotis_token_module)
+            if hasattr(token_module, 'compute_feature_importance'):
+                feat_importance = token_module.compute_feature_importance()
+                append_to_dict(metrics, feat_importance)
 
         # Compute correlation metrics once from accumulated data
         if self._corr_seq_lens:

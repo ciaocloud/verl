@@ -39,6 +39,17 @@ class TokenWeightConfig(BaseConfig):
     psi_clip_min: float = 0.2
     psi_clip_max: float = 5.0
     
+    # MLP Input Features (only applies when mode="mlp")
+    # Each scalar feature is projected to scalar_embed_dim before concat with hidden state
+    scalar_embed_dim: int = 16
+    use_hidden_state: bool = True       # h_t vector: "What am I saying?"
+    use_log_prob: bool = True           # Confidence: "Am I sure?"
+    use_entropy: bool = True            # Uncertainty: "Did I struggle?"
+    use_kl_divergence: bool = True      # Novelty: "Is this new?"
+    use_relative_position: bool = True  # Timing: "Intro or conclusion?"
+    use_semantic_drift: bool = True     # Focus: "Are we still on topic?"
+    use_local_ppl: bool = True          # Smoothed PPL: "Hard reasoning block?"
+    
     gamma_init: float = 0.1 
     lr: float = 0.001
     weight_decay: float = 1e-4

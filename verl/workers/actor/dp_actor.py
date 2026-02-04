@@ -132,8 +132,19 @@ class DataParallelPPOActor(BasePPOActor):
                     hidden_dim = actor_config.hidden_size
                     self.lotis_token_module = MLPTokenWeightModule(lotis_config.token_weight, hidden_dim).to(get_device_id())
                     self.need_hidden_states = True
+                    # Need ref_log_prob for KL divergence feature
+                    if lotis_config.token_weight.use_kl_divergence:
+                        self.need_ref_log_prob = True
                     if torch.distributed.get_rank() == 0:
-                        print(f"LOTIS: token weight module enabled (MLP), hidden_dim={hidden_dim}. Extraction of hidden states enabled.")
+                        features_enabled = []
+                        if lotis_config.token_weight.use_hidden_state: features_enabled.append("hidden")
+                        if lotis_config.token_weight.use_log_prob: features_enabled.append("logprob")
+                        if lotis_config.token_weight.use_entropy: features_enabled.append("entropy")
+                        if lotis_config.token_weight.use_kl_divergence: features_enabled.append("kl")
+                        if lotis_config.token_weight.use_relative_position: features_enabled.append("pos")
+                        if lotis_config.token_weight.use_semantic_drift: features_enabled.append("drift")
+                        if lotis_config.token_weight.use_local_ppl: features_enabled.append("local_ppl")
+                        print(f"LOTIS: token weight module enabled (MLP), features=[{','.join(features_enabled)}], hidden_dim={hidden_dim}")
                 elif lotis_config.token_weight.mode == "kl":
                     self.lotis_token_module = KLTokenWeightModule(lotis_config.token_weight).to(get_device_id())
                     self.need_ref_log_prob = True
@@ -666,7 +677,13 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
+                    # Force entropy calculation if LOTIS MLP needs it
+                    lotis_needs_entropy = (
+                        self.lotis_token_module is not None 
+                        and self.need_hidden_states  # MLP mode
+                        and getattr(self.config.lotis.token_weight, "use_entropy", False)
+                    )
+                    calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0) or lotis_needs_entropy
 
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -706,9 +723,18 @@ class DataParallelPPOActor(BasePPOActor):
                     
                     if self.lotis_token_module is not None:
                         if self.need_hidden_states and hidden_states is not None:
-                            token_weights, tis_metrics = self.lotis_token_module(hidden_states, response_mask)
+                            # Build features dict for MLP token weight module
+                            ref_log_prob = model_inputs.get("ref_log_prob", None)
+                            features = {
+                                "hidden_states": hidden_states.detach(),
+                                "log_prob": log_prob.detach(),
+                                "entropy": entropy.detach() if entropy is not None else None,
+                                "ref_log_prob": ref_log_prob.detach() if ref_log_prob is not None else None,
+                            }
+                            token_weights, tis_metrics = self.lotis_token_module(features, response_mask)
                             micro_batch_metrics.update(tis_metrics)
                         elif self.need_ref_log_prob:
+                            # KL divergence mode (legacy)
                             ref_log_prob = model_inputs.get("ref_log_prob", None)
                             if ref_log_prob is not None:
                                 token_weights, tis_metrics = self.lotis_token_module(log_prob, ref_log_prob, response_mask)
@@ -797,6 +823,14 @@ class DataParallelPPOActor(BasePPOActor):
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    
+                    # Compute feature importance for LOTIS MLP (after backward)
+                    if self.lotis_token_module is not None and self.need_hidden_states:
+                        # Get the unwrapped module (handle DDP wrapper)
+                        token_module = getattr(self.lotis_token_module, 'module', self.lotis_token_module)
+                        if hasattr(token_module, 'compute_feature_importance'):
+                            feat_importance = token_module.compute_feature_importance()
+                            micro_batch_metrics.update(feat_importance)
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
@@ -804,20 +838,29 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
 
-                # Log LOTIS grad norm ratio (lotis_grad_norm / grad_norm)
+                # Log separate LOTIS grad norms for RBF (phi) and MLP (psi)
                 if self.lotis_length_module is not None or self.lotis_token_module is not None:
-                    lotis_grad_norm = 0.0
+                    grad_norm_val = grad_norm.detach().item()
+                    
+                    # RBF (phi) grad norm
                     if self.lotis_length_module is not None:
+                        phi_grad_norm = 0.0
                         for p in self.lotis_length_module.parameters():
                             if p.grad is not None:
-                                lotis_grad_norm += p.grad.detach().data.norm(2).item() ** 2
+                                phi_grad_norm += p.grad.detach().data.norm(2).item() ** 2
+                        phi_grad_norm = phi_grad_norm ** 0.5
+                        mini_batch_metrics["lotis/phi_grad_norm"] = phi_grad_norm
+                        mini_batch_metrics["lotis/phi_grad_ratio"] = phi_grad_norm / (grad_norm_val + 1e-6)
+                    
+                    # MLP (psi) grad norm
                     if self.lotis_token_module is not None:
+                        psi_grad_norm = 0.0
                         for p in self.lotis_token_module.parameters():
                             if p.grad is not None:
-                                lotis_grad_norm += p.grad.detach().data.norm(2).item() ** 2
-                    lotis_grad_norm = lotis_grad_norm ** 0.5
-                    mini_batch_metrics["lotis/grad_norm"] = lotis_grad_norm
-                    mini_batch_metrics["lotis/grad_ratio"] = lotis_grad_norm / (grad_norm.detach().item() + 1e-6)
+                                psi_grad_norm += p.grad.detach().data.norm(2).item() ** 2
+                        psi_grad_norm = psi_grad_norm ** 0.5
+                        mini_batch_metrics["lotis/psi_grad_norm"] = psi_grad_norm
+                        mini_batch_metrics["lotis/psi_grad_ratio"] = psi_grad_norm / (grad_norm_val + 1e-6)
 
                 append_to_dict(metrics, mini_batch_metrics)
         

@@ -34,7 +34,7 @@ class TokenWeightConfig(BaseConfig):
     # MLP Config (used when mode="mlp")
     mode: str = "mlp"  # "kl" (divergence) or "mlp"
     mlp_hidden_dim: int = 256
-    mlp_num_layers: int = 2
+    mlp_num_layers: int = 1
     mlp_activation: str = "silu"
     psi_clip_min: float = 0.2
     psi_clip_max: float = 5.0

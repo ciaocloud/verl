@@ -264,12 +264,16 @@ class MLPTokenWeightModule(nn.Module):
             layers.append(act_cls())
             in_dim = config.mlp_hidden_dim
             
-        # Final projection to scalar weight (raw)
+        # Final projection to scalar (raw score, before normalization)
         layers.append(nn.Linear(in_dim, 1))
-        # Ensure positive weights
-        layers.append(nn.Softplus())
+        # NOTE: Softplus is applied separately after z-score normalization
         
         self.mlp = nn.Sequential(*layers)
+        
+        # Learnable gamma (scale) parameter for z-score normalized outputs
+        # Controls the spread of token weight differentiation
+        # Init from config.gamma_init, clamped to [0.01, config.gamma_max]
+        self.gamma = nn.Parameter(torch.tensor(config.gamma_init))
         
         # Initialize weights
         self._init_weights()
@@ -290,11 +294,10 @@ class MLPTokenWeightModule(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
         
-        # The last layer is at index -2 (before Softplus)
-        last_linear = self.mlp[-2]
-        nn.init.normal_(last_linear.weight, mean=0.0, std=0.001)
-        # Softplus(0.5413) ≈ 1.0. This makes raw weights start at 1.0.
-        nn.init.constant_(last_linear.bias, 0.5413)
+        # The last layer is the final linear (no Softplus in Sequential anymore)
+        last_linear = self.mlp[-1]
+        nn.init.normal_(last_linear.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(last_linear.bias)
     
     @staticmethod
     def compute_relative_positions(response_mask: torch.Tensor) -> torch.Tensor:
@@ -541,8 +544,26 @@ class MLPTokenWeightModule(nn.Module):
             
             combined.register_hook(save_grad_hook)
         
-        # Forward through MLP
-        w_raw = self.mlp(combined).squeeze(-1)  # (B, L)
+        # Forward through MLP to get raw scores
+        z_raw = self.mlp(combined).squeeze(-1)  # (B, L)
+        
+        # Apply z-score normalization per sequence (mean=0, std=1)
+        # Each sequence is normalized independently
+        B, L = z_raw.shape
+        seq_lens = response_mask.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, 1)
+        
+        # Compute per-sequence mean and std over valid tokens
+        z_masked = z_raw * response_mask
+        z_mean = z_masked.sum(dim=-1, keepdim=True) / seq_lens  # (B, 1)
+        z_centered = (z_raw - z_mean) * response_mask
+        z_var = (z_centered ** 2).sum(dim=-1, keepdim=True) / seq_lens.clamp(min=1)
+        z_std = z_var.sqrt().clamp(min=1e-6)  # (B, 1)
+        z_normalized = z_centered / z_std  # Per-sequence z-score
+        
+        # Apply learnable gamma (clamped for stability) and shift to positive via softplus
+        gamma = self.gamma.clamp(min=0.01, max=self.config.gamma_max)
+        scaled = z_normalized * gamma
+        w_raw = F.softplus(scaled)  # Ensure positive weights
         
         # Mask and normalize per sequence
         w_masked = w_raw * response_mask
@@ -561,7 +582,9 @@ class MLPTokenWeightModule(nn.Module):
             "lotis/psi_weight_std": psi_valid.std().item(),
             "lotis/psi_weight_max": psi_valid.max().item(),
             "lotis/psi_weight_min": psi_valid.min().item(),
-            "lotis/psi_raw_mlp_mean": w_masked[response_mask.bool()].mean().item(),
+            "lotis/psi_raw_mean": z_raw[response_mask.bool()].mean().item(),
+            "lotis/psi_raw_std": z_raw[response_mask.bool()].std().item(),
+            "lotis/psi_gamma": self.gamma.item(),
             "lotis/psi_num_features": len(feature_tensors),
         }
         

@@ -291,7 +291,9 @@ lotis:
     use_semantic_drift: true     # Focus: "Are we still on topic?"
     use_local_ppl: true          # Smoothed PPL: "Hard reasoning block?"
 
-    # KL mode parameters (only applies when mode="kl")
+    # Gamma (scale) parameters - used by both MLP and KL modes
+    # MLP: controls z-score scaling before softplus
+    # KL: controls divergence sensitivity
     gamma_init: 0.1
     gamma_max: 3.0
-    div_clip: 2.0
+    div_clip: 2.0  # KL mode only

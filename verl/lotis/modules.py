@@ -589,7 +589,7 @@ class MLPTokenWeightModule(nn.Module):
         }
         
         # Cast back to input dtype for consistency with other tensors in loss
-        return psi.to(response_mask.dtype), metrics
+        return psi, metrics
     
     def compute_feature_importance(self) -> dict[str, float]:
         """Return accumulated feature importance metrics from backward hooks.

@@ -775,11 +775,19 @@ class DataParallelPPOActor(BasePPOActor):
                         if phi_weights is not None:
                             corr_phi_weights.append(phi_weights.detach())
                         if token_weights is not None:
-                            # Mean token weight per sequence
+                            # Standard deviation of token weights per sequence
                             # token_weights: [bsz, len], response_mask: [bsz, len]
-                            seq_sum_weights = (token_weights.detach() * response_mask).sum(dim=1)
-                            seq_mean_token_weights = seq_sum_weights / (seq_len + 1e-6)
-                            corr_seq_mean_token_weights.append(seq_mean_token_weights)
+                            # We only care about the variance of weights within the sequence
+                            # (token_weights are already masked)
+                            
+                            # Manual std calculation for efficiency/masking
+                            # mean is always 1.0 by definition of our normalization
+                            # std = sqrt(mean((x - 1)^2))
+                            # (x-1)^2 * mask -> sum -> div len -> sqrt
+                            
+                            var_sum = ((token_weights - 1.0) ** 2 * response_mask).sum(dim=1)
+                            seq_std_token_weights = (var_sum / (seq_len + 1e-6)).sqrt()
+                            corr_seq_mean_token_weights.append(seq_std_token_weights)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
@@ -888,11 +896,11 @@ class DataParallelPPOActor(BasePPOActor):
                 all_seq_adv = torch.cat(corr_seq_advs)
                 if all_tis.numel() > 1:
                     if all_tis.std() > 1e-6 and all_seq_adv.std() > 1e-6:
-                        metrics["lotis/corr_seq_tis_adv"] = torch.corrcoef(
+                        metrics["lotis/corr_seq_std_tis_adv"] = torch.corrcoef(
                             torch.stack([all_tis, all_seq_adv])
                         )[0, 1].item()
                     else:
-                        metrics["lotis/corr_seq_tis_adv"] = 0.0
+                        metrics["lotis/corr_seq_std_tis_adv"] = 0.0
         
         self.actor_optimizer.zero_grad()
         return metrics

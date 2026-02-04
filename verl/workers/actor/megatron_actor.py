@@ -682,10 +682,11 @@ class MegatronPPOActor(BasePPOActor):
                     if phi_weights is not None:
                         self._corr_phi_weights.append(phi_weights.detach())
                     if token_weights is not None:
-                        # Mean token weight per sequence
-                        seq_sum_weights = (token_weights.detach() * response_mask).sum(dim=1)
-                        seq_mean_token_weights = seq_sum_weights / (seq_len + 1e-6)
-                        self._corr_seq_mean_token_weights.append(seq_mean_token_weights)
+                        # Standard deviation of token weights per sequence (mean is always 1.0)
+                        # token_weights: [bsz, len], response_mask: [bsz, len]
+                        var_sum = ((token_weights - 1.0) ** 2 * response_mask).sum(dim=1)
+                        seq_std_token_weights = (var_sum / (seq_len + 1e-6)).sqrt()
+                        self._corr_seq_mean_token_weights.append(seq_std_token_weights)
                 
                 # Log LOTIS grad norm ratio (moved to mini-batch level)
 
@@ -1063,11 +1064,11 @@ class MegatronPPOActor(BasePPOActor):
                 all_seq_adv = torch.cat(self._corr_seq_advs)
                 if all_tis.numel() > 1:
                     if all_tis.std() > 1e-6 and all_seq_adv.std() > 1e-6:
-                        metrics["lotis/corr_seq_tis_adv"] = torch.corrcoef(
+                        metrics["lotis/corr_seq_std_tis_adv"] = torch.corrcoef(
                             torch.stack([all_tis, all_seq_adv])
                         )[0, 1].item()
                     else:
-                        metrics["lotis/corr_seq_tis_adv"] = 0.0
+                        metrics["lotis/corr_seq_std_tis_adv"] = 0.0
         
         self.actor_optimizer.zero_grad()
         get_torch_device().empty_cache()

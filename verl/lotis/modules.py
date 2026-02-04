@@ -270,10 +270,7 @@ class MLPTokenWeightModule(nn.Module):
         
         self.mlp = nn.Sequential(*layers)
         
-        # Learnable gamma (scale) parameter for z-score normalized outputs
-        # Controls the spread of token weight differentiation
-        # Init from config.gamma_init, clamped to [0.01, config.gamma_max]
-        self.gamma = nn.Parameter(torch.tensor(config.gamma_init))
+
         
         # Initialize weights
         self._init_weights()
@@ -553,17 +550,11 @@ class MLPTokenWeightModule(nn.Module):
         # Forward through MLP to get raw scores
         z_raw = self.mlp(combined).squeeze(-1)  # (B, L)
         
-        # Apply z-score normalization per sequence (mean=0, std=1)
-        # Memory-efficient: reuse tensors where possible
-        seq_lens = response_mask.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, 1)
-        z_masked = z_raw * response_mask
-        z_mean = z_masked.sum(dim=-1, keepdim=True) / seq_lens
-        z_centered = (z_raw - z_mean) * response_mask
-        z_std = ((z_centered ** 2).sum(dim=-1, keepdim=True) / seq_lens).sqrt().clamp(min=1e-6)
-        
-        # Apply learnable gamma (clamped for stability) and shift to positive via softplus
-        gamma = self.gamma.clamp(min=0.01, max=self.config.gamma_max)
-        w_raw = F.softplus((z_centered / z_std) * gamma)  # Combine z_normalized and scaling
+        # Direct Softplus (no Z-score normalization)
+        # With init std=0.01, z_raw ~ N(0, 0.01)
+        # softplus(z_raw) ~ softplus(0) ~ 0.69
+        # Normalized psi will be ~ 1.0 (uniform) at start
+        w_raw = F.softplus(z_raw)
         
         # Mask and normalize per sequence
         w_masked = w_raw * response_mask
@@ -584,7 +575,6 @@ class MLPTokenWeightModule(nn.Module):
             "lotis/psi_weight_min": psi_valid.min().item(),
             "lotis/psi_raw_mean": z_raw[response_mask.bool()].mean().item(),
             "lotis/psi_raw_std": z_raw[response_mask.bool()].std().item(),
-            "lotis/psi_gamma": self.gamma.item(),
             "lotis/psi_num_features": len(feature_tensors),
         }
         

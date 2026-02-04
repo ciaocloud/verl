@@ -523,13 +523,19 @@ class MLPTokenWeightModule(nn.Module):
         combined = self.combined_norm(combined)
         
         # Register hook to capture gradients for feature importance (during training)
+        # NOTE: We use detached copies to avoid retaining the computation graph
         if self.training and combined.requires_grad:
+            # Capture only what we need, detached
+            combined_detached = combined.detach()
+            mask_detached = response_mask.detach()
+            dims_copy = dict(feature_dims)  # Copy to avoid closure issues
+            
             def save_grad_hook(grad):
                 # Compute feature importance immediately when gradient is available
-                importance = (grad * combined.detach()).abs()
-                mask_3d = response_mask.unsqueeze(-1).expand_as(importance)
+                importance = (grad * combined_detached).abs()
+                mask_3d = mask_detached.unsqueeze(-1).expand_as(importance)
                 
-                for name, (start_idx, end_idx) in feature_dims.items():
+                for name, (start_idx, end_idx) in dims_copy.items():
                     feat_importance = importance[:, :, start_idx:end_idx]
                     feat_mask = mask_3d[:, :, start_idx:end_idx]
                     valid_importance = feat_importance[feat_mask.bool()]
@@ -548,22 +554,16 @@ class MLPTokenWeightModule(nn.Module):
         z_raw = self.mlp(combined).squeeze(-1)  # (B, L)
         
         # Apply z-score normalization per sequence (mean=0, std=1)
-        # Each sequence is normalized independently
-        B, L = z_raw.shape
+        # Memory-efficient: reuse tensors where possible
         seq_lens = response_mask.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, 1)
-        
-        # Compute per-sequence mean and std over valid tokens
         z_masked = z_raw * response_mask
-        z_mean = z_masked.sum(dim=-1, keepdim=True) / seq_lens  # (B, 1)
+        z_mean = z_masked.sum(dim=-1, keepdim=True) / seq_lens
         z_centered = (z_raw - z_mean) * response_mask
-        z_var = (z_centered ** 2).sum(dim=-1, keepdim=True) / seq_lens.clamp(min=1)
-        z_std = z_var.sqrt().clamp(min=1e-6)  # (B, 1)
-        z_normalized = z_centered / z_std  # Per-sequence z-score
+        z_std = ((z_centered ** 2).sum(dim=-1, keepdim=True) / seq_lens).sqrt().clamp(min=1e-6)
         
         # Apply learnable gamma (clamped for stability) and shift to positive via softplus
         gamma = self.gamma.clamp(min=0.01, max=self.config.gamma_max)
-        scaled = z_normalized * gamma
-        w_raw = F.softplus(scaled)  # Ensure positive weights
+        w_raw = F.softplus((z_centered / z_std) * gamma)  # Combine z_normalized and scaling
         
         # Mask and normalize per sequence
         w_masked = w_raw * response_mask

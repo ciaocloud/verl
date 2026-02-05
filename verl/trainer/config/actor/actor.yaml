@@ -272,17 +272,12 @@ lotis:
     _target_: verl.lotis.config.TokenWeightConfig
     enable: false
     mode: "mlp"  # "kl" (divergence) or "mlp"
-    mlp_hidden_dim: 256
-    mlp_num_layers: 1
-    mlp_activation: "silu"
     psi_clip_min: 0.2
     psi_clip_max: 5.0
-    lr: 0.01
+    lr: 0.001
     weight_decay: 0.0001
 
     # MLP Input Features (only applies when mode="mlp")
-    # Each scalar feature is projected to scalar_embed_dim before concat
-    scalar_embed_dim: 16
     use_hidden_state: true       # h_t vector: "What am I saying?"
     use_log_prob: true           # Confidence: "Am I sure?"
     use_entropy: true            # Uncertainty: "Did I struggle?"
@@ -291,9 +286,7 @@ lotis:
     use_semantic_drift: true     # Focus: "Are we still on topic?"
     use_local_ppl: true          # Smoothed PPL: "Hard reasoning block?"
 
-    # Gamma (scale) parameters - used by both MLP and KL modes
-    # MLP: controls z-score scaling before softplus
-    # KL: controls divergence sensitivity
+    # Gamma (scale) parameters - # KL mode only, controls divergence sensitivity
     gamma_init: 0.1
     gamma_max: 3.0
-    div_clip: 2.0  # KL mode only
+    div_clip: 2.0

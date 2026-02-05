@@ -158,7 +158,6 @@ class DataParallelPPOActor(BasePPOActor):
                 lotis_params.append({
                     "params": self.lotis_token_module.parameters(),
                     "lr": lotis_config.token_weight.lr,
-                    "lr": lotis_config.token_weight.lr,
                     "weight_decay": lotis_config.token_weight.weight_decay,
                 })
             

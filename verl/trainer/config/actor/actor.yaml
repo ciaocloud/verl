@@ -262,11 +262,11 @@ lotis:
     enable: false
     num_rbf_kernels: 5
     rbf_centers: null
-    rbf_bandwidth: 1.0
+    rbf_bandwidth: 2.0
     alpha_init: 0.0
     lr: 0.001
     phi_clip_min: 0.2
-    phi_clip_max: 5.0
+    phi_clip_max: 3.0
 
   token_weight:
     _target_: verl.lotis.config.TokenWeightConfig

@@ -15,12 +15,12 @@ class LengthWeightConfig(BaseConfig):
     enable: bool = False
     num_rbf_kernels: int = 5
     rbf_centers: Optional[List[float]] = None  # None = auto linspace(-2, 2, K)
-    rbf_bandwidth: float = 1.0
+    rbf_bandwidth: float = 2.0
     alpha_init: float = 0.0  # 0 means phi=1 at init (standard GRPO)
     lr: float = 0.001
     weight_decay: float = 1e-4
     phi_clip_min: float = 0.2
-    phi_clip_max: float = 5.0
+    phi_clip_max: float = 3.0
 
 
 @dataclass

@@ -7,13 +7,14 @@ DATASET="gsm8k"
 DATE=$(date +%m%d%H)  # MMDDHH format (e.g., 012014)
 # DATE="020509"
 
-export GOOGLE_APPLICATION_CREDENTIALS=/wx-gcs-key.json 
-export WANDB_API_KEY=$(cat /workspace/wx-wandb-api-key.txt)
+# export GOOGLE_APPLICATION_CREDENTIALS=/wx-gcs-key.json 
+# export WANDB_API_KEY=$(cat /workspace/wx-wandb-api-key.txt)
 export N_GPUS=1
 export BASE_MODEL="Qwen/Qwen2.5-${MODEL_SIZE}-Instruct"
 export DATA_DIR="/workspace/data"
 export PROJ_NAME='verl-lotis'
-export EXP_NAME="TOKMLP-1e-3-${MODEL_SIZE}-${DATASET}-${DATE}"
+# export EXP_NAME="TOKMLP-1e-3-${MODEL_SIZE}-${DATASET}-${DATE}"
+export EXP_NAME="LENRBF-1e-2-${MODEL_SIZE}-${DATASET}-${DATE}"
 
 # Use verl's default checkpoint path
 export CKPT_DIR="checkpoints/${PROJ_NAME}/${EXP_NAME}"
@@ -48,9 +49,9 @@ nohup python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.actor.lotis.length_weight.enable=False \
+    actor_rollout_ref.actor.lotis.length_weight.enable=True \
     actor_rollout_ref.actor.lotis.length_weight.lr=0.01 \
-    actor_rollout_ref.actor.lotis.token_weight.enable=True \
+    actor_rollout_ref.actor.lotis.token_weight.enable=False \
     actor_rollout_ref.actor.lotis.token_weight.lr=0.001 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \

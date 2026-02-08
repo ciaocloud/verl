@@ -11,15 +11,9 @@ from verl.lotis.config import LengthWeightConfig, TokenWeightConfig
 class RBFLengthWeightModule(nn.Module):
     """Computes sequence-level weights using RBF kernels on z-score normalized lengths.
     
-    phi(z) = scaled_sigmoid(sum_k alpha_k * K(z, mu_k)) where K is Gaussian kernel.
+    phi(z) = exp(sum_k alpha_k * K(z, mu_k)) where K is Gaussian kernel.
     Output is normalized to preserve gradient energy.
-    
-    Uses scaled sigmoid for bounded output and amplified gradients.
     """
-    
-    # Sigmoid output scaling range (amplifies gradients ~5x)
-    SIGMOID_SCALE_MIN = 0.1
-    SIGMOID_SCALE_MAX = 5.0
 
     def __init__(self, config: LengthWeightConfig):
         super().__init__()
@@ -85,11 +79,9 @@ class RBFLengthWeightModule(nn.Module):
         z_exp = z.unsqueeze(-1)  # (batch_size, 1)
         kernels = torch.exp(-(z_exp - self.centers) ** 2 / self.bandwidth_sq_2)  # (batch_size, K)
         
-        # Using sigmoid for bounded output and stable gradients
-        # Scale to [SIGMOID_SCALE_MIN, SIGMOID_SCALE_MAX] for stronger gradients
+        # phi = exp(sum_k alpha_k * K(z, mu_k))
         weighted_sum = (self.alphas * kernels).sum(dim=-1)  # (batch_size,)
-        scale_range = self.SIGMOID_SCALE_MAX - self.SIGMOID_SCALE_MIN
-        phi_raw = self.SIGMOID_SCALE_MIN + scale_range * torch.sigmoid(weighted_sum)
+        phi_raw = torch.exp(weighted_sum)
         
         # Normalize to mean=1 (preserves gradient energy)
         phi = phi_raw / phi_raw.mean().clamp(min=1e-8)

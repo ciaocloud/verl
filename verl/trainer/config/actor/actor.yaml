@@ -264,9 +264,9 @@ lotis:
     rbf_centers: null
     rbf_bandwidth: 2.0
     alpha_init: 0.0
-    lr: 0.001
+    lr: 0.01
     phi_clip_min: 0.2
-    phi_clip_max: 3.0
+    phi_clip_max: 5.0
 
   token_weight:
     _target_: verl.lotis.config.TokenWeightConfig

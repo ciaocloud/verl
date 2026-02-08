@@ -630,7 +630,10 @@ class DataParallelPPOActor(BasePPOActor):
         non_tensor_select_keys = []
         if has_multi_modal_inputs:
             non_tensor_select_keys.append("multi_modal_inputs")
-        if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
+        # Pass uid for prefix grouper OR LOTIS group-wise length normalization
+        if "uid" in data.non_tensor_batch.keys() and (
+            self.use_prefix_grouper or self.lotis_length_module is not None
+        ):
             non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -717,7 +720,8 @@ class DataParallelPPOActor(BasePPOActor):
                     phi_weights = None
                     token_weights = None
                     if self.lotis_length_module is not None:
-                        phi_weights, phi_metrics = self.lotis_length_module(response_mask)
+                        group_indices = micro_batch.non_tensor_batch.get("uid", None)
+                        phi_weights, phi_metrics = self.lotis_length_module(response_mask, group_indices=group_indices)
                         micro_batch_metrics.update(phi_metrics)
                     
                     if self.lotis_token_module is not None:

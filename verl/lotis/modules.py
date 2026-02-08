@@ -38,23 +38,48 @@ class RBFLengthWeightModule(nn.Module):
         self.register_buffer("centers", centers)
         self.register_buffer("bandwidth_sq_2", torch.tensor(2.0 * config.rbf_bandwidth ** 2))
 
-    def forward(self, response_mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+    def forward(
+        self, 
+        response_mask: torch.Tensor, 
+        group_indices: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute phi weights from response mask.
         
         Args:
             response_mask: (batch_size, seq_len) binary mask
+            group_indices: (batch_size,) group IDs for each sample. If provided,
+                z-score is computed per-group. Samples in singleton groups
+                fall back to batch-level normalization.
             
         Returns:
             phi: (batch_size,) weights normalized to mean=1
             metrics: dict of metrics
         """
+        from verl.utils import as_torch_index, group_mean_std
+        
         # Get sequence lengths
         lengths = response_mask.sum(dim=-1).float()  # (batch_size,)
         
-        # Z-score normalization within batch
-        mu = lengths.mean()
-        sigma = lengths.std().clamp(min=1e-8)
-        z = (lengths - mu) / sigma  # (batch_size,)
+        # Compute batch-level stats (used as fallback for singletons)
+        batch_mu = lengths.mean()
+        batch_sigma = lengths.std().clamp(min=1e-8)
+        
+        if group_indices is not None:
+            # Group-wise z-score normalization
+            g = as_torch_index(group_indices, device=lengths.device)
+            mu_g, sigma_g, count_g = group_mean_std(lengths, g, eps=1e-8, device=lengths.device)
+            
+            # Compute group-wise z-scores
+            z = (lengths - mu_g[g]) / (sigma_g[g] + 1e-8)
+            
+            # Fallback to batch-level for singleton groups (count <= 1)
+            is_singleton = count_g[g] <= 1
+            if is_singleton.any():
+                batch_z = (lengths - batch_mu) / batch_sigma
+                z = torch.where(is_singleton, batch_z, z)
+        else:
+            # Batch-level z-score (backward compatible)
+            z = (lengths - batch_mu) / batch_sigma
         
         # RBF kernels: K(z, mu_k) = exp(-(z - mu_k)^2 / (2 * sigma^2))
         z_exp = z.unsqueeze(-1)  # (batch_size, 1)
@@ -73,8 +98,8 @@ class RBFLengthWeightModule(nn.Module):
         phi = phi.clamp(self.config.phi_clip_min, self.config.phi_clip_max)
         
         metrics = {
-            "lotis/response_length_mean": mu.item(),
-            "lotis/response_length_std": sigma.item(),
+            "lotis/response_length_mean": batch_mu.item(),
+            "lotis/response_length_std": batch_sigma.item(),
             # Center kernel weight (assuming centers are sorted and middle one is ~0)
             "lotis/rbf_kernel_weight_center": self.alphas[self.config.num_rbf_kernels // 2].item(),
             "lotis/rbf_alphas_mean": self.alphas.mean().item(),

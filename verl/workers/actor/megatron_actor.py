@@ -480,11 +480,19 @@ class MegatronPPOActor(BasePPOActor):
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        # Include uid for LOTIS group-wise length normalization
+        self.has_uid = "uid" in data.non_tensor_batch.keys() and self.lotis_length_module is not None
         # router replay
         if self.enable_routing_replay:
             select_keys.append("routed_experts")
+        # Build non_tensor_select_keys
+        non_tensor_select_keys = []
         if self.has_multi_modal_inputs:
-            data = data.select(select_keys, ["multi_modal_inputs"])
+            non_tensor_select_keys.append("multi_modal_inputs")
+        if self.has_uid:
+            non_tensor_select_keys.append("uid")
+        if non_tensor_select_keys:
+            data = data.select(select_keys, non_tensor_select_keys)
         else:
             data = data.select(batch_keys=select_keys)
 
@@ -530,6 +538,9 @@ class MegatronPPOActor(BasePPOActor):
             mini_batch.batch["multi_modal_inputs_idx"] = torch.Tensor(
                 list(range(len(mini_batch.non_tensor_batch["multi_modal_inputs"])))
             ).to(torch.int64)
+        # Copy uid to batch for loss_func access (group-wise LOTIS normalization)
+        if self.has_uid:
+            mini_batch.batch["uid"] = mini_batch.non_tensor_batch["uid"]
 
         if mini_batch.batch["position_ids"].dim() == 3:  # qwen2vl mrope [bs, 3, seq_len]
             mini_batch.batch["position_ids"] = mini_batch.batch["position_ids"][
@@ -616,7 +627,8 @@ class MegatronPPOActor(BasePPOActor):
                 phi_weights = None
                 token_weights = None
                 if self.lotis_length_module is not None:
-                    phi_weights, phi_metrics = self.lotis_length_module(response_mask)
+                    group_indices = data.get("uid", None)
+                    phi_weights, phi_metrics = self.lotis_length_module(response_mask, group_indices=group_indices)
                     stats.update(phi_metrics)
                 
                 if self.lotis_token_module is not None:

@@ -251,62 +251,46 @@ class MLPTokenWeightModule(nn.Module):
         self.config = config
         self.hidden_dim = hidden_dim  # Input hidden state dimension
         
-        # 3. Build MLP
-        # We project scalar features and hidden state, then concat
-        # Then pass through SwiGLU-based MLP
-        
-        # Define scalar feature list
-        self.scalar_features = []
+        self.enabled_features = []  # (name, input_dim, embed_dim)
+        if config.use_hidden_state:
+            self.enabled_features.append(("hidden_state", hidden_dim, self.HIDDEN_EMBED_DIM))
         if config.use_log_prob:
-            self.scalar_features.append("log_prob")
+            self.enabled_features.append(("log_prob", 1, self.SCALAR_EMBED_DIM))
         if config.use_entropy:
-            self.scalar_features.append("entropy")
+            self.enabled_features.append(("entropy", 1, self.SCALAR_EMBED_DIM))
         if config.use_kl_divergence:
-            self.scalar_features.append("kl_divergence")
+            self.enabled_features.append(("kl_divergence", 1, self.SCALAR_EMBED_DIM))
         if config.use_relative_position:
-            self.scalar_features.append("position")
+            # Multi-scale sinusoidal encoding directly produces SCALAR_EMBED_DIM features
+            self.enabled_features.append(("position", self.SCALAR_EMBED_DIM, self.SCALAR_EMBED_DIM))
         if config.use_semantic_drift:
-            self.scalar_features.append("semantic_drift")
+            self.enabled_features.append(("semantic_drift", 1, self.SCALAR_EMBED_DIM))
         if config.use_local_ppl:
-            self.scalar_features.append("local_ppl")
+            self.enabled_features.append(("local_ppl", 1, self.SCALAR_EMBED_DIM))
         
         # Input projections for scalar features
-        self.scalar_projections = nn.ModuleDict({
-            k: nn.Sequential(
-                nn.Linear(1, self.SCALAR_EMBED_DIM),
-                nn.SiLU() # Non-linearity for scalar embedding
-            ) for k in self.scalar_features
-        })
+        self.projections = nn.ModuleDict()
+        for name, input_dim, embed_dim in self.enabled_features:
+            # Position encoding is already embedded dimension, no projection needed
+            if name == "position":
+                continue
+            if name == "hidden_state":
+                self.projections[name] = nn.Linear(input_dim, embed_dim)
+            else:
+                self.projections[name] = nn.Linear(input_dim, embed_dim)
         
-        # Compute total input dim
-        input_dim = 0
-        if config.use_hidden_state:
-            # Project hidden state to HIDDEN_EMBED_DIM
-            # This balances the influence of the massive hidden state vs scalar features
-            self.hidden_projection = nn.Sequential(
-                nn.Linear(hidden_dim, self.HIDDEN_EMBED_DIM),
-                nn.SiLU(),
-            )
-            input_dim += self.HIDDEN_EMBED_DIM
-        input_dim += len(self.scalar_features) * self.SCALAR_EMBED_DIM
+        # Compute total input dim (embed_dim is the output of projection, we want the dimension *after* projection = embed_dim)
+        in_dim = sum(dim for _, _, dim in self.enabled_features)
         
-        # Build MLP
+        # Build MLP: LayerNorm + SwiGLU layers + final projection
         layers = []
-        in_dim = input_dim
+        layers.append(nn.LayerNorm(in_dim))
         
-        # Pre-norm on concatenated feature vector
-        self.combined_norm = nn.LayerNorm(input_dim)
-        
-        # Store input_dim for feature importance tracking
-        self.input_dim = input_dim
-
         for _ in range(self.MLP_NUM_LAYERS):
             layers.append(SwiGLU(in_dim, self.MLP_HIDDEN_DIM))
             in_dim = self.MLP_HIDDEN_DIM
-            
         # Final projection to scalar
         layers.append(nn.Linear(in_dim, 1))
-        
         self.mlp = nn.Sequential(*layers)
         
         # Initialize weights
@@ -321,35 +305,51 @@ class MLPTokenWeightModule(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         
-        # We want final layer to start small to ensure near-uniform weights initially
-        last_linear = self.mlp[-1]
-        if isinstance(last_linear, nn.Linear):
-            nn.init.normal_(last_linear.weight, mean=0.0, std=0.01)
-            nn.init.zeros_(last_linear.bias)
-    
+        # # We want final layer to start small to ensure near-uniform weights initially
+        # last_linear = self.mlp[-1]
+        # if isinstance(last_linear, nn.Linear):
+        #     nn.init.normal_(last_linear.weight, mean=0.0, std=0.01)
+        #     nn.init.zeros_(last_linear.bias)
+
     @staticmethod
-    def compute_relative_positions(response_mask: torch.Tensor) -> torch.Tensor:
-        """Compute relative position in [0, 1] for each token.
+    def compute_position_encoding(response_mask: torch.Tensor, dim: int = 16) -> torch.Tensor:
+        """Compute multi-scale sinusoidal positional encoding for each token.
+        
+        Returns PE vector of size `dim` for each token.
+        Uses standard geometric progression of frequencies.
         
         Args:
             response_mask: (B, L) binary mask
+            dim: output dimension (must be even)
             
         Returns:
-            rel_pos: (B, L) where rel_pos[b, t] = t / seq_len[b]
+            pos_enc: (B, L, dim)
         """
         B, L = response_mask.shape
         device = response_mask.device
+        half_dim = dim // 2
         
-        # Create position indices: 0, 1, 2, ...
-        positions = torch.arange(L, device=device).unsqueeze(0).expand(B, -1).float()
+        # Normalized position in [0, 1]
+        positions = torch.arange(L, device=device).float() / max(L, 1)  # (L,)
         
-        # Get sequence lengths
-        seq_lens = response_mask.sum(dim=-1, keepdim=True).clamp(min=1).float()
+        # Create frequencies: geometric progression from 1.0 to 10000.0
+        # Standard transformer uses 10000^(2i/d_model).
+        # Since our position is normalized [0,1], we scale by 10000 to cover
+        # the full range (period=1) down to finer details (period=1/10000).
+        # Frequencies: 1.0 ... 10000.0
+        freqs = torch.exp(torch.arange(half_dim, device=device, dtype=torch.float) * (math.log(10000.0) / (half_dim - 1)))
         
-        # Normalize to [0, 1]
-        rel_pos = positions / seq_lens
+        # Calculate angle: pos * freq * pi
+        args = positions.unsqueeze(1) * freqs.unsqueeze(0) * math.pi  # (L, half_dim)
         
-        return rel_pos * response_mask
+        # Create embedding (L, dim)
+        # Interleave sin/cos? or concat? Concat is simpler.
+        pos_enc = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (L, dim)
+        
+        # Expand to batch
+        pos_enc = pos_enc.unsqueeze(0).expand(B, -1, -1)  # (B, L, dim)
+        
+        return pos_enc * response_mask.unsqueeze(-1)
     
     @staticmethod
     def compute_local_ppl(log_prob: torch.Tensor, response_mask: torch.Tensor, window: int = 8) -> torch.Tensor:
@@ -419,19 +419,13 @@ class MLPTokenWeightModule(nn.Module):
             semantic_drift: (B, L) where higher = more drift from prompt
         """
         B, L, D = hidden_states.shape
-        device = hidden_states.device
-        
-        # The response_mask marks response tokens. The prompt is everything before.
-        # Since hidden_states is already sliced to response length, we use position 0
-        # (which corresponds to the first response token, whose hidden state 
-        # incorporates all prompt context).
-        # 
-        # Alternative: we could pass prompt_hidden separately, but this is simpler.
-        # Using h[0] as prompt representation (transformer has seen full prompt by then)
+
+        # Using h[0] as prompt representation
+        # We ask actors pass only last token of prompt along with response tokens 
+        # to MLP forward method. This applies to both hidden_states and response_mask.
         prompt_hidden = hidden_states[:, 0:1, :]  # (B, 1, D)
         
         # Compute cosine similarity between each token and prompt
-        # Normalize hidden states
         h_norm = F.normalize(hidden_states, p=2, dim=-1)  # (B, L, D)
         prompt_norm = F.normalize(prompt_hidden, p=2, dim=-1)  # (B, 1, D)
         
@@ -475,8 +469,7 @@ class MLPTokenWeightModule(nn.Module):
         # 1. Hidden state (vector feature)
         if self.config.use_hidden_state:
             hidden_states = features["hidden_states"].detach().to(mlp_dtype)
-            # Project to lower dimension
-            hidden_embedded = self.hidden_projection(hidden_states)
+            hidden_embedded = self.projections["hidden_state"](hidden_states)
             feature_tensors.append(hidden_embedded)
             feature_dims["hidden"] = (current_idx, current_idx + self.HIDDEN_EMBED_DIM)
             current_idx += self.HIDDEN_EMBED_DIM
@@ -485,7 +478,7 @@ class MLPTokenWeightModule(nn.Module):
         # Log prob (confidence)
         if self.config.use_log_prob and "log_prob" in features:
             log_prob = features["log_prob"].detach().to(mlp_dtype)
-            log_prob_embed = self.scalar_projections["log_prob"](
+            log_prob_embed = self.projections["log_prob"](
                 log_prob.unsqueeze(-1)
             )  # (B, L, embed_dim)
             feature_tensors.append(log_prob_embed)
@@ -495,9 +488,9 @@ class MLPTokenWeightModule(nn.Module):
         # Entropy (uncertainty)
         if self.config.use_entropy and "entropy" in features and features["entropy"] is not None:
             entropy = features["entropy"].detach().to(mlp_dtype)
-            entropy_embed = self.scalar_projections["entropy"](
+            entropy_embed = self.projections["entropy"](
                 entropy.unsqueeze(-1)
-            )
+            )            
             feature_tensors.append(entropy_embed)
             feature_dims["entropy"] = (current_idx, current_idx + self.SCALAR_EMBED_DIM)
             current_idx += self.SCALAR_EMBED_DIM
@@ -507,7 +500,7 @@ class MLPTokenWeightModule(nn.Module):
             log_prob = features["log_prob"].detach().to(mlp_dtype)
             ref_log_prob = features["ref_log_prob"].detach().to(mlp_dtype)
             kl_div = (log_prob - ref_log_prob).abs()  # Use absolute KL for stability
-            kl_embed = self.scalar_projections["kl_divergence"](
+            kl_embed = self.projections["kl_divergence"](
                 kl_div.unsqueeze(-1)
             )
             feature_tensors.append(kl_embed)
@@ -516,11 +509,11 @@ class MLPTokenWeightModule(nn.Module):
         
         # Relative position (timing)
         if self.config.use_relative_position:
-            rel_pos = self.compute_relative_positions(response_mask).to(mlp_dtype)
-            rel_pos_embed = self.scalar_projections["position"](
-                rel_pos.unsqueeze(-1)
-            )
-            feature_tensors.append(rel_pos_embed)
+            # Already projected to SCALAR_EMBED_DIM by computation
+            pos_enc = self.compute_position_encoding(
+                response_mask, dim=self.SCALAR_EMBED_DIM
+            ).to(mlp_dtype)
+            feature_tensors.append(pos_enc)
             feature_dims["position"] = (current_idx, current_idx + self.SCALAR_EMBED_DIM)
             current_idx += self.SCALAR_EMBED_DIM
         
@@ -528,7 +521,7 @@ class MLPTokenWeightModule(nn.Module):
         if self.config.use_semantic_drift and "hidden_states" in features:
             hidden_states = features["hidden_states"].detach().to(mlp_dtype)
             sem_drift = self.compute_semantic_drift(hidden_states, response_mask)
-            sem_drift_embed = self.scalar_projections["semantic_drift"](
+            sem_drift_embed = self.projections["semantic_drift"](
                 sem_drift.unsqueeze(-1)
             )
             feature_tensors.append(sem_drift_embed)
@@ -539,7 +532,7 @@ class MLPTokenWeightModule(nn.Module):
         if self.config.use_local_ppl and "log_prob" in features:
             log_prob = features["log_prob"].detach().to(mlp_dtype)
             local_ppl = self.compute_local_ppl(log_prob, response_mask, window=self.LOCAL_PPL_WINDOW)
-            local_ppl_embed = self.scalar_projections["local_ppl"](
+            local_ppl_embed = self.projections["local_ppl"](
                 local_ppl.unsqueeze(-1)
             )
             feature_tensors.append(local_ppl_embed)
@@ -548,9 +541,6 @@ class MLPTokenWeightModule(nn.Module):
         
         # Concatenate all features
         combined = torch.cat(feature_tensors, dim=-1)  # (B, L, total_dim)
-        
-        # Apply LayerNorm on concatenated features (before MLP)
-        combined = self.combined_norm(combined)
         
         # Register hook to capture gradients for feature importance (during training)
         # NOTE: We use detached copies to avoid retaining the computation graph
@@ -584,9 +574,6 @@ class MLPTokenWeightModule(nn.Module):
         w_raw = self.mlp(combined).squeeze(-1)  # (B, L)
         
         # Softplus for positivity
-        # With init std=0.01, w_raw ~ N(0, 0.01)
-        # softplus(w_raw) ~ softplus(0) ~ 0.69
-        # Normalized psi will be ~ 1.0 (uniform) at start
         w_raw = F.softplus(w_raw)
         
         # Mask and normalize per sequence
@@ -608,7 +595,6 @@ class MLPTokenWeightModule(nn.Module):
             "lotis/psi_weight_min": psi_valid.min().item(),
             "lotis/psi_raw_mean": w_raw[response_mask.bool()].mean().item(),
             "lotis/psi_raw_std": w_raw[response_mask.bool()].std().item(),
-            "lotis/psi_num_features": len(feature_tensors),
         }
         
         # Cast back to input dtype for consistency with other tensors in loss

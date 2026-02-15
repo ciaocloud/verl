@@ -200,6 +200,9 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        # Add v_stored for LOGO hybrid advantage
+        if "v_stored" in data.batch:
+            adv_kwargs["v_stored"] = data.batch["v_stored"]
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -336,6 +339,12 @@ class RayPPOTrainer:
             )
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
+        # LOGO: wrap dataset to inject persistent prompt IDs and create curriculum sampler
+        if self.config.algorithm.get("adv_estimator", "") == "logo":
+            self._init_logo(train_dataset)
+            train_dataset = self._logo_dataset  # use wrapped dataset
+            train_sampler = self._logo_sampler   # use curriculum sampler
+
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
@@ -392,6 +401,110 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    # ------------------------------------------------------------------
+    # LOGO initialization
+    # ------------------------------------------------------------------
+
+    def _init_logo(self, train_dataset):
+        """Set up LOGO meta-store, dataset wrapper, and curriculum sampler."""
+        import verl.logo.advantage  # registers "logo" advantage estimator
+        from verl.logo.meta_store import PromptMetaStore
+        from verl.logo.sampler import LOGOCurriculumSampler
+
+        logo_cfg = self.config.algorithm.get("logo", {})
+
+        # 1. Meta-store
+        alpha_init = logo_cfg.get("alpha_init", 1.0)
+        beta_init = logo_cfg.get("beta_init", 1.0)
+        self._logo_meta_store = PromptMetaStore(alpha_init=alpha_init, beta_init=beta_init)
+        prompt_ids = [str(i) for i in range(len(train_dataset))]
+        self._logo_meta_store.initialize(prompt_ids)
+
+        # 2. Thin dataset wrapper that injects persistent prompt IDs
+        class _IndexedDataset:
+            def __init__(self, ds):
+                self._ds = ds
+
+            def __len__(self):
+                return len(self._ds)
+
+            def __getitem__(self, idx):
+                item = self._ds[idx]
+                item["logo_prompt_id"] = str(idx)
+                return item
+
+        self._logo_dataset = _IndexedDataset(train_dataset)
+
+        # 3. Curriculum sampler
+        self._logo_sampler = LOGOCurriculumSampler(
+            data_source=self._logo_dataset,
+            data_config=self.config.data,
+        )
+        self._logo_sampler.configure(
+            meta_store=self._logo_meta_store,
+            logo_config=logo_cfg,
+        )
+
+    def _logo_preflight(self):
+        """Run pre-flight epoch: rollout 1 sample per prompt to seed meta-store values.
+
+        Iterates through the training data, generates one response per prompt using
+        the current policy, computes rewards, and initialises the Bayesian value
+        estimates accordingly.  Skipped when ``algorithm.logo.preflight.enable`` is
+        False (default).
+        """
+        logo_cfg = self.config.algorithm.get("logo", {})
+        pf_cfg = logo_cfg.get("preflight", {})
+        if not pf_cfg.get("enable", False):
+            return
+
+        print("[LOGO] Running pre-flight epoch ...")
+
+        alpha_blend = pf_cfg.get("alpha_blend", 0.5)
+        sample_fraction = pf_cfg.get("sample_fraction", 1.0)
+
+        total_updated = 0
+        for batch_dict in self.train_dataloader:
+            batch = DataProto.from_single_dict(batch_dict)
+
+            # Skip prompts based on sample_fraction
+            if sample_fraction < 1.0 and np.random.rand() > sample_fraction:
+                continue
+
+            # Assign uid for grouping (n=1 so each prompt is its own group)
+            batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+            )
+
+            gen_batch = self._get_gen_batch(batch)
+            gen_batch.meta_info["global_steps"] = 0
+            # n=1 rollout: no repeat needed
+            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+
+            batch = batch.union(gen_batch_output)
+
+            # Compute reward
+            reward_tensor, _ = self._compute_or_extract_reward(batch, reward_fn=self.reward_fn)
+            batch.batch["token_level_scores"] = reward_tensor
+
+            # Sequence-level reward
+            response_mask = compute_response_mask(batch)
+            seq_rewards = (reward_tensor * response_mask).sum(dim=-1)  # (bs,)
+
+            # Update meta-store with initial values
+            if "logo_prompt_id" in batch.non_tensor_batch:
+                prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
+                self._logo_meta_store.update(
+                    prompt_ids=prompt_ids,
+                    rewards=seq_rewards,
+                    step=0,
+                    decay_mode="fixed",
+                    gamma=1.0,  # no decay for initialization
+                )
+                total_updated += len(prompt_ids)
+
+        print(f"[LOGO] Pre-flight complete: seeded {total_updated} prompt values.")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1323,6 +1436,10 @@ class RayPPOTrainer:
         self._load_checkpoint()
         self.checkpoint_manager.update_weights()
 
+        # LOGO: pre-flight epoch to seed meta-store with initial value estimates
+        if hasattr(self, "_logo_meta_store"):
+            self._logo_preflight()
+
         current_epoch = self.global_steps // len(self.train_dataloader)
 
         # perform validation before training
@@ -1583,6 +1700,11 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
+                        # LOGO: populate v_stored from meta-store before advantage computation
+                        if hasattr(self, "_logo_meta_store") and "logo_prompt_id" in batch.non_tensor_batch:
+                            prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
+                            batch.batch["v_stored"] = self._logo_meta_store.get_value(prompt_ids)
+
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1692,6 +1814,10 @@ class RayPPOTrainer:
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
+
+                # LOGO: collect meta-store statistics
+                if hasattr(self, "_logo_meta_store"):
+                    metrics.update(self._logo_meta_store.get_statistics(current_step=self.global_steps))
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

@@ -1,0 +1,54 @@
+# LOGO: Learning with Optimized Gradients and Opportunity sampling
+# Reference config -- use via command line overrides:
+#   algorithm.adv_estimator=logo algorithm.logo.advantage.tau=0.1
+
+# LOGO-specific parameters (nested under algorithm.logo in the main config)
+logo:
+  # Value tracking mode: "bayesian" (Beta distribution) or "ema" (simple exponential moving average)
+  value_mode: bayesian
+
+  # Beta distribution prior (only used in bayesian mode)
+  alpha_init: 1.0
+  beta_init: 1.0
+
+  # Initial value estimate (only used in ema mode)
+  value_init: 0.5
+
+  sampling:
+    # Weight for confidence gap in priority score
+    rho: 1.0
+    # null = weighted multinomial over all prompts; int = deterministic top-K
+    top_k: null
+    # Bonus per step since last visit
+    staleness_bonus: 0.01
+
+  advantage:
+    # Temperature for adaptive lambda: lower = more adaptive
+    # sigma^2=0 => lambda=1 (trust stored value); sigma^2=0.25 => lambda=exp(-2.5)=0.08 (trust group)
+    tau: 0.1
+    # Whether to adapt lambda based on group variance
+    adaptive_lambda: true
+    # Fixed lambda value (used when adaptive_lambda=false)
+    lambda_fixed: 0.5
+
+  decay:
+    # "fixed": gamma^delta_t (time-based); "adaptive": 1/(1 + sensitivity * drift) (drift-based)
+    mode: adaptive
+    # Base exponential decay factor (for fixed mode)
+    gamma: 0.99
+    # Sensitivity for adaptive mode: gamma = 1/(1 + sensitivity * |V - R_bar|)
+    sensitivity: 2.0
+    # Clip bounds for gamma to prevent extreme decay or memory
+    gamma_clip_min: 0.1
+    gamma_clip_max: 0.95
+
+  rag_miner:
+    enable: false
+    similarity_threshold: 0.7
+    k_neighbors: 5
+    sample_freq: 5
+
+  preflight:
+    enable: false
+    sample_fraction: 1.0
+    alpha_blend: 0.5

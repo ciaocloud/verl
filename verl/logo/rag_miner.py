@@ -60,6 +60,7 @@ class StochasticMiner:
         """Sample from Lake and extrapolate values via KNN on embeddings.
 
         Uses Memory prompts as RAG source neighbors.
+        Similarity computation runs on GPU when available.
 
         Returns:
             Dict mapping lake prompt_id -> guessed value (also stored in cache).
@@ -90,24 +91,31 @@ class StochasticMiner:
 
         memory_values = self.meta_store.get_value(memory_ids)  # (n_memory,)
 
-        # cosine similarity: (n_lake, n_memory)
-        lake_norm = F.normalize(lake_embs.float(), p=2, dim=-1)
-        mem_norm = F.normalize(memory_embs.float(), p=2, dim=-1)
-        sims = lake_norm @ mem_norm.t()
+        # Move to GPU for similarity computation
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        lake_embs_d = lake_embs.float().to(device)
+        memory_embs_d = memory_embs.float().to(device)
+        memory_values_d = memory_values.to(device)
 
-        guesses = {}
-        k = min(self.k_neighbors, len(memory_ids))
+        # cosine similarity: (n_lake, n_memory) — computed on GPU
+        with torch.no_grad():
+            lake_norm = F.normalize(lake_embs_d, p=2, dim=-1)
+            mem_norm = F.normalize(memory_embs_d, p=2, dim=-1)
+            sims = lake_norm @ mem_norm.t()
 
-        for i, pid in enumerate(lake_ids):
-            topk_sims, topk_idx = sims[i].topk(k)
-            mask = topk_sims >= self.similarity_threshold
+            guesses = {}
+            k = min(self.k_neighbors, len(memory_ids))
 
-            if mask.sum() == 0:
-                guesses[pid] = memory_values.mean().item()
-            else:
-                valid_sims = topk_sims[mask]
-                valid_vals = memory_values[topk_idx[mask]]
-                guesses[pid] = (valid_sims * valid_vals).sum().item() / valid_sims.sum().item()
+            for i, pid in enumerate(lake_ids):
+                topk_sims, topk_idx = sims[i].topk(k)
+                threshold_mask = topk_sims >= self.similarity_threshold
+
+                if threshold_mask.sum() == 0:
+                    guesses[pid] = memory_values_d.mean().item()
+                else:
+                    valid_sims = topk_sims[threshold_mask]
+                    valid_vals = memory_values_d[topk_idx[threshold_mask]]
+                    guesses[pid] = (valid_sims * valid_vals).sum().item() / valid_sims.sum().item()
 
         self.value_cache.update(guesses)
         return guesses

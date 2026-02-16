@@ -418,6 +418,8 @@ class DataParallelPPOActor(BasePPOActor):
     def compute_embeddings(self, data: DataProto) -> dict[str, torch.Tensor]:
         """Mean-pool last hidden state over prompt tokens.
 
+        All computation (forward pass + pooling) runs on GPU.
+
         Returns:
             dict with "embeddings": tensor of shape (batch_size, hidden_dim), float32, on CPU.
         """
@@ -433,8 +435,8 @@ class DataParallelPPOActor(BasePPOActor):
         emb_list = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
-            with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
-                with torch.no_grad():
+            with torch.no_grad():
+                with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
                     output = self.actor_module(
                         input_ids=micro_batch.batch["input_ids"],
                         attention_mask=micro_batch.batch["attention_mask"],
@@ -444,18 +446,20 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     last_hidden = output.hidden_states[-1]  # (bs, seq_len, hidden_dim)
 
-            # Pool over prompt tokens only (exclude response tokens if present)
-            attn = micro_batch.batch["attention_mask"]
-            if "response_mask" in micro_batch.batch:
-                prompt_mask = attn.clone()
-                resp_mask = micro_batch.batch["response_mask"]
-                resp_len = resp_mask.size(-1)
-                prompt_mask[:, -resp_len:] = prompt_mask[:, -resp_len:] - resp_mask
-            else:
-                prompt_mask = attn
+                # Pool over prompt tokens only (exclude response tokens if present)
+                # All tensors are on GPU here
+                attn = micro_batch.batch["attention_mask"]
+                if "response_mask" in micro_batch.batch:
+                    prompt_mask = attn.clone()
+                    resp_mask = micro_batch.batch["response_mask"]
+                    resp_len = resp_mask.size(-1)
+                    prompt_mask[:, -resp_len:] = prompt_mask[:, -resp_len:] - resp_mask
+                else:
+                    prompt_mask = attn
 
-            mask = prompt_mask.unsqueeze(-1).float()
-            pooled = (last_hidden.float() * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                mask = prompt_mask.unsqueeze(-1).float()
+                pooled = (last_hidden.float() * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+
             emb_list.append(pooled.cpu())
 
         return {"embeddings": torch.cat(emb_list, dim=0)}

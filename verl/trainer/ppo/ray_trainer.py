@@ -593,49 +593,51 @@ class RayPPOTrainer:
         return self.ref_policy_wg.compute_ref_embeddings(batch)
 
     def _store_logo_embeddings(self, batch: DataProto):
-        """Compute and store ref-policy embeddings for prompts that don't have them yet."""
+        """Compute and store ref-policy embeddings for prompts that don't have them yet.
+
+        Deduplicates before the forward pass so each prompt is computed exactly once,
+        even when rollout.n > 1 causes repeated prompt IDs in the batch.
+        """
         if not hasattr(self, "_logo_meta_store") or not self.use_reference_policy:
             return
+        if getattr(self, "_logo_miner", None) is None:
+            return  # embeddings only needed when RAG miner is enabled
         if "logo_prompt_id" not in batch.non_tensor_batch:
             return
 
         prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
-        # Only compute for prompts that don't have embeddings yet
-        missing = [pid for pid in prompt_ids if pid not in self._logo_meta_store._embeddings]
-        if not missing:
+
+        # Deduplicate: pick first occurrence of each prompt_id that lacks an embedding
+        seen = set()
+        unique_indices = []
+        unique_pids = []
+        for i, pid in enumerate(prompt_ids):
+            if pid not in seen and pid not in self._logo_meta_store._embeddings:
+                seen.add(pid)
+                unique_indices.append(i)
+                unique_pids.append(pid)
+        if not unique_pids:
             return
 
-        # Filter batch to missing prompts only
-        missing_set = set(missing)
-        mask = np.array([pid in missing_set for pid in prompt_ids])
-        sub_batch = batch.select_idxs(mask)
+        sub_batch = batch.select_idxs(unique_indices)
 
         sub_batch_padded, pad_size = pad_dataproto_to_divisor(sub_batch, self.ref_policy_wg.world_size)
         ref_embs_padded = self._compute_ref_embeddings(sub_batch_padded)
         ref_embs = unpad_dataproto(ref_embs_padded, pad_size=pad_size)
 
-        # Deduplicate: only store first embedding per prompt_id
-        stored = set()
-        unique_pids = []
-        unique_indices = []
-        sub_pids = sub_batch.non_tensor_batch["logo_prompt_id"].tolist()
-        for i, pid in enumerate(sub_pids):
-            if pid not in stored:
-                stored.add(pid)
-                unique_pids.append(pid)
-                unique_indices.append(i)
-
-        unique_embs = ref_embs.batch["ref_embeddings"][unique_indices]
-        self._logo_meta_store.set_embeddings(unique_pids, unique_embs)
+        self._logo_meta_store.set_embeddings(unique_pids, ref_embs.batch["ref_embeddings"])
 
     def _compute_missing_logo_embeddings(self):
-        """Compute embeddings for Lake prompts that don't have them yet.
+        """Compute embeddings for prompts that don't have them yet.
 
         Tokenizes prompts from the dataset and sends through the ref model.
         Called before each epoch so the RAG miner can use embeddings.
+        Only runs when the RAG miner is enabled (embeddings have no other consumer).
         """
         if not hasattr(self, "_logo_meta_store") or not self.use_reference_policy:
             return
+        if getattr(self, "_logo_miner", None) is None:
+            return  # embeddings only needed when RAG miner is enabled
 
         missing = self._logo_meta_store.prompts_without_embeddings()
         if not missing:
@@ -821,11 +823,13 @@ class RayPPOTrainer:
             return reward_tensor, reward_extra_infos_dict
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        # Keys to keep in batch (not sent to rollout workers)
+        keep_keys = {"data_source", "reward_model", "extra_info", "uid", "logo_prompt_id"}
+        keep_keys = keep_keys & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
-        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - keep_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
@@ -1742,9 +1746,6 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-
-                    # LOGO: compute embeddings for new prompts
-                    self._store_logo_embeddings(batch)
 
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,

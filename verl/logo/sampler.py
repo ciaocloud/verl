@@ -88,6 +88,9 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         Sampler-level epsilon-greedy: each yielded index is replaced with a
         uniformly random index with probability ``epsilon``.  This is the
         primary mechanism for Lake exploration (prompts with no score info).
+
+        Sample counts are reset per-epoch and incremented lazily as the
+        DataLoader consumes indices (not eagerly when the epoch starts).
         """
         if self.meta_store is None:
             # not configured yet -- fall back to sequential
@@ -115,8 +118,11 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
                 if np.random.rand() < eps:
                     idx_list[i] = np.random.randint(0, self.n_prompts)
 
-        self._sample_counts.update(idx_list)
-        yield from idx_list
+        # Reset per-epoch; count lazily as DataLoader consumes indices
+        self._sample_counts = Counter()
+        for idx in idx_list:
+            self._sample_counts[idx] += 1
+            yield idx
 
     # ------------------------------------------------------------------
     # Curriculum callback (called by trainer at end of each step)

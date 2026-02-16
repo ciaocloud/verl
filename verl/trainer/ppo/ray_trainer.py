@@ -409,21 +409,26 @@ class RayPPOTrainer:
     def _init_logo(self, train_dataset):
         """Set up LOGO meta-store, dataset wrapper, and curriculum sampler."""
         import verl.logo.advantage  # registers "logo" advantage estimator
+        from verl.logo.config import LOGOConfig
         from verl.logo.meta_store import PromptMetaStore
         from verl.logo.sampler import LOGOCurriculumSampler
+        from omegaconf import OmegaConf
 
-        logo_cfg = self.config.algorithm.get("logo", {})
+        # Get LOGO config from algorithm config
+        logo_cfg_dict = self.config.algorithm.get("logo", {})
+
+        # Create structured config by merging with defaults
+        logo_cfg = OmegaConf.merge(
+            OmegaConf.structured(LOGOConfig),
+            logo_cfg_dict
+        )
 
         # 1. Meta-store
-        mode = logo_cfg.get("value_mode", "bayesian")
-        alpha_init = logo_cfg.get("alpha_init", 1.0)
-        beta_init = logo_cfg.get("beta_init", 1.0)
-        value_init = logo_cfg.get("value_init", 0.5)
         self._logo_meta_store = PromptMetaStore(
-            mode=mode,
-            alpha_init=alpha_init,
-            beta_init=beta_init,
-            value_init=value_init,
+            mode=logo_cfg.value_mode,
+            alpha_init=logo_cfg.alpha_init,
+            beta_init=logo_cfg.beta_init,
+            value_init=logo_cfg.value_init,
         )
         # Note: prompt_ids are registered via sampler.configure() below (lazy init)
 
@@ -460,15 +465,22 @@ class RayPPOTrainer:
         estimates accordingly.  Skipped when ``algorithm.logo.preflight.enable`` is
         False (default).
         """
-        logo_cfg = self.config.algorithm.get("logo", {})
-        pf_cfg = logo_cfg.get("preflight", {})
-        if not pf_cfg.get("enable", False):
+        from verl.logo.config import LOGOConfig
+        from omegaconf import OmegaConf
+
+        logo_cfg_dict = self.config.algorithm.get("logo", {})
+        logo_cfg = OmegaConf.merge(
+            OmegaConf.structured(LOGOConfig),
+            logo_cfg_dict
+        )
+
+        if not logo_cfg.preflight.enable:
             return
 
         print("[LOGO] Running pre-flight epoch ...")
 
-        alpha_blend = pf_cfg.get("alpha_blend", 0.5)
-        sample_fraction = pf_cfg.get("sample_fraction", 1.0)
+        alpha_blend = logo_cfg.preflight.alpha_blend
+        sample_fraction = logo_cfg.preflight.sample_fraction
 
         total_updated = 0
         for batch_dict in self.train_dataloader:

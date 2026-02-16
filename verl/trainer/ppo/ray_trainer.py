@@ -415,11 +415,17 @@ class RayPPOTrainer:
         logo_cfg = self.config.algorithm.get("logo", {})
 
         # 1. Meta-store
+        mode = logo_cfg.get("value_mode", "bayesian")
         alpha_init = logo_cfg.get("alpha_init", 1.0)
         beta_init = logo_cfg.get("beta_init", 1.0)
-        self._logo_meta_store = PromptMetaStore(alpha_init=alpha_init, beta_init=beta_init)
-        prompt_ids = [str(i) for i in range(len(train_dataset))]
-        self._logo_meta_store.initialize(prompt_ids)
+        value_init = logo_cfg.get("value_init", 0.5)
+        self._logo_meta_store = PromptMetaStore(
+            mode=mode,
+            alpha_init=alpha_init,
+            beta_init=beta_init,
+            value_init=value_init,
+        )
+        # Note: prompt_ids are registered via sampler.configure() below (lazy init)
 
         # 2. Thin dataset wrapper that injects persistent prompt IDs
         class _IndexedDataset:

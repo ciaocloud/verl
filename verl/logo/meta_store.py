@@ -26,19 +26,18 @@ class PromptMetaStore:
     - "ema": Tracks simple exponential moving average V(x)
     """
 
-    def __init__(
-        self,
-        mode: str = "bayesian",
-        alpha_init: float = 1.0,
-        beta_init: float = 1.0,
-        value_init: float = 0.5,
-    ):
+    # Hardcoded priors
+    ALPHA_INIT = 1.0  # Beta distribution prior alpha (bayesian mode)
+    BETA_INIT = 1.0   # Beta distribution prior beta (bayesian mode)
+    VALUE_INIT = 0.5   # Initial value estimate (ema mode)
+
+    def __init__(self, mode: str = "bayesian"):
         if mode not in ("bayesian", "ema"):
             raise ValueError(f"mode must be 'bayesian' or 'ema', got {mode}")
         self.mode = mode
-        self.alpha_init = alpha_init
-        self.beta_init = beta_init
-        self.value_init = value_init
+        self.alpha_init = self.ALPHA_INIT
+        self.beta_init = self.BETA_INIT
+        self.value_init = self.VALUE_INIT
         self._store: Dict[str, dict] = {}
         self._all_prompt_ids: List[str] = []
 
@@ -325,18 +324,12 @@ class PromptMetaStore:
     def state_dict(self) -> dict:
         return {
             "mode": self.mode,
-            "alpha_init": self.alpha_init,
-            "beta_init": self.beta_init,
-            "value_init": self.value_init,
             "all_prompt_ids": self._all_prompt_ids,
             "store": dict(self._store),
         }
 
     def load_state_dict(self, sd: dict):
         self.mode = sd.get("mode", "bayesian")
-        self.alpha_init = sd["alpha_init"]
-        self.beta_init = sd["beta_init"]
-        self.value_init = sd.get("value_init", 0.5)
         self._all_prompt_ids = sd.get("all_prompt_ids", [])
         self._store = sd["store"]
 

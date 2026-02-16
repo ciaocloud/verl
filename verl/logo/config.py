@@ -56,9 +56,6 @@ class LOGOConfig(BaseConfig):
     _mutable_fields = {"_meta_store_ref"}
 
     value_mode: str = "bayesian"  # "bayesian" (Beta distribution) or "ema" (simple EMA)
-    alpha_init: float = 1.0  # Beta distribution prior alpha (bayesian mode only)
-    beta_init: float = 1.0  # Beta distribution prior beta (bayesian mode only)
-    value_init: float = 0.5  # Initial value estimate (ema mode only)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     advantage: AdvantageConfig = field(default_factory=AdvantageConfig)
     decay: DecayConfig = field(default_factory=DecayConfig)

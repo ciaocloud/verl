@@ -128,15 +128,6 @@ algorithm:
     # Value tracking mode: "bayesian" (Beta distribution) or "ema" (simple exponential moving average)
     value_mode: bayesian
 
-    # Beta distribution prior (only used in bayesian mode)
-    alpha_init: 1.0
-
-    # Beta distribution prior (only used in bayesian mode)
-    beta_init: 1.0
-
-    # Initial value estimate (only used in ema mode)
-    value_init: 0.5
-
     # Sampling configuration
     sampling:
 
@@ -151,6 +142,9 @@ algorithm:
 
       # Bonus per step since last visit
       staleness_bonus: 0.01
+
+      # Epsilon-greedy exploration rate (EMA mode only)
+      epsilon: 0.1
 
     # Advantage computation configuration
     advantage:

@@ -425,12 +425,7 @@ class RayPPOTrainer:
         )
 
         # 1. Meta-store
-        self._logo_meta_store = PromptMetaStore(
-            mode=logo_cfg.value_mode,
-            alpha_init=logo_cfg.alpha_init,
-            beta_init=logo_cfg.beta_init,
-            value_init=logo_cfg.value_init,
-        )
+        self._logo_meta_store = PromptMetaStore(mode=logo_cfg.value_mode)
         # Note: prompt_ids are registered via sampler.configure() below (lazy init)
 
         # 2. Stochastic miner (RAG-based value extrapolation for Lake prompts)

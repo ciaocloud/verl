@@ -119,6 +119,109 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # LOGO (Learning with Optimized Gradients and Opportunity sampling) configuration
+  logo:
+
+    # Target dataclass for this configuration
+    _target_: verl.logo.config.LOGOConfig
+
+    # Value tracking mode: "bayesian" (Beta distribution) or "ema" (simple exponential moving average)
+    value_mode: bayesian
+
+    # Beta distribution prior (only used in bayesian mode)
+    alpha_init: 1.0
+
+    # Beta distribution prior (only used in bayesian mode)
+    beta_init: 1.0
+
+    # Initial value estimate (only used in ema mode)
+    value_init: 0.5
+
+    # Sampling configuration
+    sampling:
+
+      # Target dataclass for this configuration
+      _target_: verl.logo.config.SamplingConfig
+
+      # Weight for confidence gap in priority score
+      rho: 1.0
+
+      # null = weighted multinomial over all prompts; int = deterministic top-K
+      top_k: null
+
+      # Bonus per step since last visit
+      staleness_bonus: 0.01
+
+    # Advantage computation configuration
+    advantage:
+
+      # Target dataclass for this configuration
+      _target_: verl.logo.config.AdvantageConfig
+
+      # Temperature for adaptive lambda: lower = more adaptive
+      # sigma^2=0 => lambda=1 (trust stored value); sigma^2=0.25 => lambda=exp(-2.5)=0.08 (trust group)
+      tau: 0.1
+
+      # Whether to adapt lambda based on group variance
+      adaptive_lambda: true
+
+      # Fixed lambda value (used when adaptive_lambda=false)
+      lambda_fixed: 0.5
+
+    # Value decay configuration
+    decay:
+
+      # Target dataclass for this configuration
+      _target_: verl.logo.config.DecayConfig
+
+      # "fixed": gamma^delta_t (time-based); "adaptive": 1/(1 + sensitivity * drift) (drift-based)
+      mode: adaptive
+
+      # Base exponential decay factor (for fixed mode)
+      gamma: 0.99
+
+      # Sensitivity for adaptive mode: gamma = 1/(1 + sensitivity * |V - R_bar|)
+      sensitivity: 2.0
+
+      # Clip bounds for gamma to prevent extreme decay or memory
+      gamma_clip_min: 0.1
+
+      # Clip bounds for gamma to prevent extreme decay or memory
+      gamma_clip_max: 0.95
+
+    # RAG-based stochastic miner configuration
+    rag_miner:
+
+      # Target dataclass for this configuration
+      _target_: verl.logo.config.RAGMinerConfig
+
+      # Whether to enable RAG-based value extrapolation
+      enable: false
+
+      # Similarity threshold for KNN
+      similarity_threshold: 0.7
+
+      # Number of neighbors for KNN
+      k_neighbors: 5
+
+      # Sample from lake every N epochs
+      sample_freq: 5
+
+    # Pre-flight initialization configuration
+    preflight:
+
+      # Target dataclass for this configuration
+      _target_: verl.logo.config.PreFlightConfig
+
+      # Whether to run pre-flight epoch
+      enable: false
+
+      # Fraction of prompts to scout
+      sample_fraction: 1.0
+
+      # V_0 = blend*R + (1-blend)*P_ref
+      alpha_blend: 0.5
+
 # config for the trainer
 trainer:
 

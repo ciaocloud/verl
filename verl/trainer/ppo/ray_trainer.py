@@ -216,7 +216,12 @@ def compute_advantage(
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
 
         # calculate advantage estimator
-        advantages, returns = adv_estimator_fn(**adv_kwargs)
+        result = adv_estimator_fn(**adv_kwargs)
+        if isinstance(result, tuple) and len(result) == 3:
+            advantages, returns, adv_metrics = result
+            data.meta_info.update(adv_metrics)
+        else:
+            advantages, returns = result
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     return data
@@ -1857,11 +1862,40 @@ class RayPPOTrainer:
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
-                # LOGO: collect meta-store and miner statistics
+                # LOGO: collect all LOGO metrics
                 if hasattr(self, "_logo_meta_store"):
+                    # advantage metrics (populated by compute_logo_hybrid_advantage)
+                    logo_adv_keys = [
+                        k for k in batch.meta_info if k.startswith("logo/")
+                    ]
+                    for k in logo_adv_keys:
+                        metrics[k] = batch.meta_info[k]
+
+                    # stored value vs actual reward
+                    if "v_stored" in batch.batch and "token_level_scores" in batch.batch:
+                        v_s = batch.batch["v_stored"].float()
+                        r_s = batch.batch["token_level_scores"].sum(dim=-1).float()
+                        if v_s.std() > 1e-8 and r_s.std() > 1e-8:
+                            corr = torch.corrcoef(torch.stack([v_s, r_s]))[0, 1].item()
+                            metrics["logo/value_reward_corr"] = corr
+                        metrics["logo/value_prediction_error"] = (v_s - r_s).pow(2).mean().item()
+                        metrics["logo/batch_reward_mean"] = r_s.mean().item()
+
+                    # cumulative unique prompts explored
+                    if not hasattr(self, "_logo_unique_prompts_seen"):
+                        self._logo_unique_prompts_seen = set()
+                    if "logo_prompt_id" in batch.non_tensor_batch:
+                        self._logo_unique_prompts_seen.update(
+                            batch.non_tensor_batch["logo_prompt_id"].tolist()
+                        )
+                    metrics["logo/unique_prompts_seen"] = float(len(self._logo_unique_prompts_seen))
+
+                    # meta-store, miner, and sampler statistics
                     metrics.update(self._logo_meta_store.get_statistics(current_step=self.global_steps))
                     if getattr(self, "_logo_miner", None) is not None:
                         metrics.update(self._logo_miner.get_statistics())
+                    if hasattr(self, "_logo_sampler") and hasattr(self._logo_sampler, "get_statistics"):
+                        metrics.update(self._logo_sampler.get_statistics())
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

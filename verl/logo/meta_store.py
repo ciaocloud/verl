@@ -41,6 +41,9 @@ class PromptMetaStore:
         self._store: Dict[str, dict] = {}
         self._all_prompt_ids: List[str] = []
 
+        # Step-level accumulators (reset each update() call, read by get_statistics)
+        self._last_update_metrics: Dict[str, float] = {}
+
     # ------------------------------------------------------------------
     # Dataset Registration & Memory/Lake Topology
     # ------------------------------------------------------------------
@@ -184,6 +187,11 @@ class PromptMetaStore:
         for pid, r in zip(prompt_ids, rewards_np):
             grouped[pid].append(float(r))
 
+        # Step-level accumulators for metrics
+        gammas = []
+        drifts = []
+        uncertainties = []
+
         for pid, rs in grouped.items():
             if pid not in self._store:
                 self._lazy_initialize(pid)
@@ -204,6 +212,9 @@ class PromptMetaStore:
             else:
                 raise ValueError(f"Unknown decay mode: {decay_mode}")
 
+            gammas.append(float(decay))
+            drifts.append(abs(v_old - r_bar))
+
             # Apply update
             if self.mode == "bayesian":
                 new_alpha = entry["alpha"] * decay + sum(r for r in rs)
@@ -215,9 +226,23 @@ class PromptMetaStore:
                 v_new = decay * v_old + (1.0 - decay) * r_bar
                 entry["value"] = np.clip(v_new, 0.0, 1.0)
 
+            v_new = entry["value"]
+            uncertainties.append(math.sqrt(v_new * (1.0 - v_new)))
+
             entry["n_obs"] += len(rs)
             entry["last_step"] = step
             entry["last_logprob"] = 0.0  # updated externally if needed
+
+        # Store step-level metrics for get_statistics() to report
+        if gammas:
+            self._last_update_metrics = {
+                "logo/decay_mean": float(np.mean(gammas)),
+                "logo/decay_std": float(np.std(gammas)),
+                "logo/value_drift": float(np.mean(drifts)),
+                "logo/value_uncertainty": float(np.mean(uncertainties)),
+            }
+        else:
+            self._last_update_metrics = {}
 
     # ------------------------------------------------------------------
     # Sampling scores
@@ -238,7 +263,7 @@ class PromptMetaStore:
             Sample p_tilde ~ Beta(alpha, beta).
             S = sqrt(p_tilde*(1-p_tilde)) + rho * |p_tilde - e^{-NLL_last}| + staleness
             Exploration comes from posterior width: uncertain prompts produce
-            more variable p_tilde samples → occasionally high scores.
+            more variable p_tilde samples -> occasionally high scores.
 
         EMA mode (epsilon-greedy):
             With probability epsilon: S = uniform random in [0, 1] (explore).
@@ -258,7 +283,7 @@ class PromptMetaStore:
             if entry is not None:
                 # Memory prompt
                 if self.mode == "bayesian":
-                    # Thompson sampling: wider posterior → more exploration
+                    # Thompson sampling: wider posterior -> more exploration
                     p = float(np.random.beta(entry["alpha"], entry["beta"]))
                 else:
                     # Epsilon-greedy: occasionally explore randomly
@@ -342,23 +367,35 @@ class PromptMetaStore:
             return {}
         values = [e["value"] for e in self._store.values()]
         staleness = [current_step - e["last_step"] for e in self._store.values()]
-        n_obs = [e["n_obs"] for e in self._store.values()]
+        staleness_sorted = sorted(staleness)
+
         stats = {
-            "logo/meta_store_size": float(len(self._store)),
-            "logo/value_mean": float(np.mean(values)),
-            "logo/value_std": float(np.std(values)),
-            "logo/value_min": float(np.min(values)),
-            "logo/value_max": float(np.max(values)),
+            "logo/store_size": float(len(self._store)),
+            "logo/store_value_mean": float(np.mean(values)),
+            "logo/store_value_std": float(np.std(values)),
+            "logo/store_value_min": float(np.min(values)),
+            "logo/store_value_max": float(np.max(values)),
             "logo/staleness_mean": float(np.mean(staleness)),
             "logo/staleness_max": float(np.max(staleness)),
-            "logo/n_obs_mean": float(np.mean(n_obs)),
+            "logo/staleness_p90": float(staleness_sorted[int(len(staleness_sorted) * 0.9)]),
         }
+
+        # Memory / Lake fraction
+        total = len(self._all_prompt_ids) if self._all_prompt_ids else len(self._store)
+        stats["logo/memory_fraction"] = float(len(self._store)) / max(total, 1)
+
         if self.mode == "bayesian":
             alphas = [e["alpha"] for e in self._store.values()]
             betas = [e["beta"] for e in self._store.values()]
+            concentrations = [a + b for a, b in zip(alphas, betas)]
             stats.update({
                 "logo/alpha_mean": float(np.mean(alphas)),
                 "logo/beta_mean": float(np.mean(betas)),
-                "logo/concentration_mean": float(np.mean([a + b for a, b in zip(alphas, betas)])),
+                "logo/concentration_mean": float(np.mean(concentrations)),
+                "logo/concentration_std": float(np.std(concentrations)),
             })
+
+        # Include step-level metrics from last update() call
+        stats.update(self._last_update_metrics)
+
         return stats

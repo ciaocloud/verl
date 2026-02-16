@@ -18,7 +18,7 @@ def compute_logo_hybrid_advantage(
     config: Optional[AlgoConfig] = None,
     v_stored: Optional[torch.Tensor] = None,
     **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
     """Compute LOGO hybrid advantage.
 
     A_i = (R_i - mu_group) + lambda * (R_i - V_stored)
@@ -35,8 +35,11 @@ def compute_logo_hybrid_advantage(
             Must be pre-populated in data.batch before calling compute_advantage.
 
     Returns:
-        (advantages, returns) both of shape (bs, response_length).
+        (advantages, returns, metrics) where metrics is a dict of LOGO-specific
+        scalar metrics for logging.
     """
+    metrics = {}
+
     with torch.no_grad():
         # sequence-level reward
         scores = token_level_rewards.sum(dim=-1)  # (bs,)
@@ -92,4 +95,21 @@ def compute_logo_hybrid_advantage(
         # broadcast to token level
         advantages = normalised.unsqueeze(-1) * response_mask
 
-    return advantages, advantages
+        # --- metrics ---
+        metrics["logo/lambda_mean"] = lam.mean().item()
+        metrics["logo/lambda_std"] = lam.std().item()
+        metrics["logo/sigma_group_mean"] = sigma_group.mean().item()
+        metrics["logo/grpo_adv_abs_mean"] = grpo_adv.abs().mean().item()
+        metrics["logo/ppo_adv_abs_mean"] = ppo_adv.abs().mean().item()
+        grpo_mag = grpo_adv.abs().mean().item()
+        ppo_mag = ppo_adv.abs().mean().item()
+        metrics["logo/global_local_ratio"] = ppo_mag / max(grpo_mag, epsilon)
+
+        # sign conflict: GRPO says positive, stored value says negative
+        if v_stored is not None:
+            conflict = ((grpo_adv > 0) & (ppo_adv < 0)) | ((grpo_adv < 0) & (ppo_adv > 0))
+            metrics["logo/sign_conflict_rate"] = conflict.float().mean().item()
+        else:
+            metrics["logo/sign_conflict_rate"] = 0.0
+
+    return advantages, advantages, metrics

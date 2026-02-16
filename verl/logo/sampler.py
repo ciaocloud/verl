@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sized
 from typing import Iterator, Optional
 
@@ -46,6 +47,9 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         self.current_step: int = 0
         self._epoch: int = 0
         self._scores: Optional[torch.Tensor] = None
+
+        # Per-prompt cumulative sample counts (how many times each index was yielded)
+        self._sample_counts: Counter = Counter()
 
     # ------------------------------------------------------------------
     # Setup (called by trainer before fit)
@@ -97,7 +101,9 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             weights = torch.softmax(self._scores, dim=0)
             indices = torch.multinomial(weights, num_samples=self.n_prompts, replacement=False)
 
-        yield from indices.tolist()
+        idx_list = indices.tolist()
+        self._sample_counts.update(idx_list)
+        yield from idx_list
 
     # ------------------------------------------------------------------
     # Curriculum callback (called by trainer at end of each step)
@@ -187,3 +193,47 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             epsilon=scfg.epsilon if scfg else 0.1,
             lake_value_estimates=lake_values,
         )
+
+    # ------------------------------------------------------------------
+    # Statistics (for logging)
+    # ------------------------------------------------------------------
+
+    def get_statistics(self) -> dict:
+        """Return priority score and sample count metrics."""
+        stats = {}
+
+        # Priority score metrics
+        if self._scores is not None and len(self._scores) > 0:
+            scores = self._scores
+            stats.update({
+                "logo/priority_mean": scores.mean().item(),
+                "logo/priority_std": scores.std().item(),
+                "logo/priority_max": scores.max().item(),
+                "logo/priority_min": scores.min().item(),
+            })
+
+            # Entropy: how concentrated the sampling distribution is
+            weights = torch.softmax(scores, dim=0)
+            log_weights = torch.log(weights + 1e-10)
+            entropy = -(weights * log_weights).sum().item()
+            max_entropy = float(np.log(len(scores)))
+            stats["logo/priority_entropy"] = entropy
+            stats["logo/priority_entropy_ratio"] = entropy / max(max_entropy, 1e-10)
+
+            # Top-bottom spread
+            k = max(1, len(scores) // 10)
+            top_k = torch.topk(scores, k=k).values.mean().item()
+            bot_k = torch.topk(scores, k=k, largest=False).values.mean().item()
+            stats["logo/priority_top10pct"] = top_k
+            stats["logo/priority_bot10pct"] = bot_k
+
+        # Sample count metrics (over visited prompts only)
+        if self._sample_counts:
+            counts = list(self._sample_counts.values())
+            stats["logo/sample_count_mean"] = float(np.mean(counts))
+            stats["logo/sample_count_std"] = float(np.std(counts))
+            stats["logo/sample_count_max"] = float(np.max(counts))
+            stats["logo/sample_count_min"] = float(np.min(counts))
+            stats["logo/prompts_sampled"] = float(len(counts))
+
+        return stats

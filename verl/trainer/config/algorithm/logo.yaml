@@ -14,7 +14,7 @@ logo:
     top_k: null
     # Bonus per step since last visit
     staleness_bonus: 0.01
-    # Epsilon-greedy exploration rate (EMA mode only)
+    # Sampler-level epsilon-greedy: probability of replacing a selected index with uniform random
     epsilon: 0.1
 
   advantage:
@@ -46,4 +46,4 @@ logo:
   preflight:
     enable: true
     sample_fraction: 1.0
-    alpha_blend: 0.5
+    blend: 0.5

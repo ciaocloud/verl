@@ -213,8 +213,8 @@ algorithm:
       # Fraction of prompts to scout
       sample_fraction: 1.0
 
-      # V_0 = blend*R + (1-blend)*P_ref
-      alpha_blend: 0.5
+      # V_0 = blend + (R - blend) * exp(mean_logprob)
+      blend: 0.5
 
 # config for the trainer
 trainer:

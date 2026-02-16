@@ -1070,6 +1070,37 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    def compute_ref_embeddings(self, data: DataProto):
+        """Compute reference-policy embeddings (mean-pooled last hidden state)."""
+        if self._is_lora:
+            data.meta_info["is_lora"] = True
+            policy = self.actor
+        else:
+            assert self._is_ref
+            policy = self.ref_policy
+
+        micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["micro_batch_size"] = micro_batch_size
+        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            outputs = policy.compute_embeddings(data=data)
+            output = DataProto.from_dict(tensors={"ref_embeddings": outputs["embeddings"]})
+
+        output = output.to("cpu")
+
+        # reshard
+        model = policy.actor_module
+        if self.world_size > 1:
+            if fsdp_version(model) == 1:
+                model._handle.reshard(True)
+            elif fsdp_version(model) == 2:
+                model.reshard()
+
+        return output
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         from verl.utils.logger import log_with_rank

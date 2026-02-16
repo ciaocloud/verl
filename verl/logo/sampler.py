@@ -83,7 +83,12 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         return self.n_prompts
 
     def __iter__(self) -> Iterator[int]:
-        """Yield dataset indices for one epoch, ordered by sampling score."""
+        """Yield dataset indices for one epoch, ordered by sampling score.
+
+        Sampler-level epsilon-greedy: each yielded index is replaced with a
+        uniformly random index with probability ``epsilon``.  This is the
+        primary mechanism for Lake exploration (prompts with no score info).
+        """
         if self.meta_store is None:
             # not configured yet -- fall back to sequential
             yield from range(self.n_prompts)
@@ -102,6 +107,14 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             indices = torch.multinomial(weights, num_samples=self.n_prompts, replacement=False)
 
         idx_list = indices.tolist()
+
+        # Sampler-level epsilon-greedy: randomly replace some indices
+        eps = self.sampling_cfg.epsilon if self.sampling_cfg else 0.1
+        if eps > 0:
+            for i in range(len(idx_list)):
+                if np.random.rand() < eps:
+                    idx_list[i] = np.random.randint(0, self.n_prompts)
+
         self._sample_counts.update(idx_list)
         yield from idx_list
 
@@ -190,7 +203,6 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             current_step=self.current_step,
             rho=scfg.rho if scfg else 1.0,
             staleness_bonus=scfg.staleness_bonus if scfg else 0.01,
-            epsilon=scfg.epsilon if scfg else 0.1,
             lake_value_estimates=lake_values,
         )
 

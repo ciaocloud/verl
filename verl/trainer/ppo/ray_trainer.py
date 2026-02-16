@@ -472,9 +472,17 @@ class RayPPOTrainer:
     def _logo_preflight(self):
         """Run pre-flight epoch: rollout 1 sample per prompt to seed meta-store.
 
-        For Bayesian mode: adds one observation per prompt on top of the prior.
-            Natural decay downweights this during training.
-        For EMA mode: skipped (single-sample EMA is just noise).
+        The initial value estimate shrinks the reward toward a neutral center
+        proportionally to model uncertainty:
+
+            V_init = blend + (R - blend) * exp(mean_logprob)
+
+        When the model is confident (exp(mean_logprob) ≈ 1), V_init ≈ R.
+        When the model is uncertain (exp(mean_logprob) ≈ 0), V_init ≈ blend.
+        This reduces the noise of single-sample reward estimates, especially
+        important for fixed (non-adaptive) decay where the initial value persists.
+
+        If logprobs are not available, falls back to raw reward.
 
         Skipped when ``algorithm.logo.preflight.enable`` is False.
         """
@@ -488,10 +496,6 @@ class RayPPOTrainer:
         )
 
         if not logo_cfg.preflight.enable:
-            return
-
-        if logo_cfg.value_mode != "bayesian":
-            print("[LOGO] Pre-flight skipped (only useful for Bayesian mode).")
             return
 
         print("[LOGO] Running pre-flight epoch ...")
@@ -537,21 +541,144 @@ class RayPPOTrainer:
             batch.batch["token_level_scores"] = reward_tensor
 
             response_mask = compute_response_mask(batch)
+            batch.batch["response_mask"] = response_mask
             seq_rewards = (reward_tensor * response_mask).sum(dim=-1)
+
+            # LOGO: compute embeddings for preflight prompts
+            self._store_logo_embeddings(batch)
 
             if "logo_prompt_id" in batch.non_tensor_batch:
                 prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
+
+                # --- logprob-based fix: blend reward with model confidence ---
+                log_probs = None
+                if "rollout_log_probs" in batch.batch:
+                    log_probs = batch.batch["rollout_log_probs"]
+                elif "old_log_probs" in batch.batch:
+                    log_probs = batch.batch["old_log_probs"]
+
+                if log_probs is not None:
+                    mask_sum = response_mask.sum(dim=-1).clamp(min=1)
+                    mean_lp = (log_probs * response_mask).sum(dim=-1) / mask_sum
+                    confidence = mean_lp.exp().clamp(0.0, 1.0)
+                    blend = logo_cfg.preflight.blend
+                    # Shrink reward toward neutral center by model uncertainty
+                    blended_rewards = blend + (seq_rewards - blend) * confidence
+                else:
+                    blended_rewards = seq_rewards
+                    mean_lp = None
+
                 self._logo_meta_store.update(
                     prompt_ids=prompt_ids,
-                    rewards=seq_rewards,
+                    rewards=blended_rewards,
                     step=0,
                     decay_mode="fixed",
                     gamma=1.0,
                     gamma_clip_max=1.0,
                 )
+
+                # Store mean logprob for confidence gap in sampling scores
+                if mean_lp is not None:
+                    lp_np = mean_lp.detach().cpu().float().numpy()
+                    for pid, lp in zip(prompt_ids, lp_np):
+                        if pid in self._logo_meta_store._store:
+                            self._logo_meta_store._store[pid]["last_logprob"] = float(lp)
+
                 total_updated += len(prompt_ids)
 
         print(f"[LOGO] Pre-flight complete: seeded {total_updated} prompt values.")
+
+    def _compute_ref_embeddings(self, batch: DataProto) -> DataProto:
+        """Compute reference-policy embeddings for a batch."""
+        return self.ref_policy_wg.compute_ref_embeddings(batch)
+
+    def _store_logo_embeddings(self, batch: DataProto):
+        """Compute and store ref-policy embeddings for prompts that don't have them yet."""
+        if not hasattr(self, "_logo_meta_store") or not self.use_reference_policy:
+            return
+        if "logo_prompt_id" not in batch.non_tensor_batch:
+            return
+
+        prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
+        # Only compute for prompts that don't have embeddings yet
+        missing = [pid for pid in prompt_ids if pid not in self._logo_meta_store._embeddings]
+        if not missing:
+            return
+
+        # Filter batch to missing prompts only
+        missing_set = set(missing)
+        mask = np.array([pid in missing_set for pid in prompt_ids])
+        sub_batch = batch.select_idxs(mask)
+
+        sub_batch_padded, pad_size = pad_dataproto_to_divisor(sub_batch, self.ref_policy_wg.world_size)
+        ref_embs_padded = self._compute_ref_embeddings(sub_batch_padded)
+        ref_embs = unpad_dataproto(ref_embs_padded, pad_size=pad_size)
+
+        # Deduplicate: only store first embedding per prompt_id
+        stored = set()
+        unique_pids = []
+        unique_indices = []
+        sub_pids = sub_batch.non_tensor_batch["logo_prompt_id"].tolist()
+        for i, pid in enumerate(sub_pids):
+            if pid not in stored:
+                stored.add(pid)
+                unique_pids.append(pid)
+                unique_indices.append(i)
+
+        unique_embs = ref_embs.batch["ref_embeddings"][unique_indices]
+        self._logo_meta_store.set_embeddings(unique_pids, unique_embs)
+
+    def _compute_missing_logo_embeddings(self):
+        """Compute embeddings for Lake prompts that don't have them yet.
+
+        Tokenizes prompts from the dataset and sends through the ref model.
+        Called before each epoch so the RAG miner can use embeddings.
+        """
+        if not hasattr(self, "_logo_meta_store") or not self.use_reference_policy:
+            return
+
+        missing = self._logo_meta_store.prompts_without_embeddings()
+        if not missing:
+            return
+
+        print(f"[LOGO] Computing embeddings for {len(missing)} prompts ...")
+
+        chunk_size = self.config.data.get("train_batch_size", 256)
+        for start in range(0, len(missing), chunk_size):
+            chunk = missing[start : start + chunk_size]
+            # Tokenize prompts from the dataset
+            all_ids = []
+            for pid in chunk:
+                item = self._logo_dataset[int(pid)]
+                raw_prompt = item.get("raw_prompt") or item.get("prompt")
+                if isinstance(raw_prompt, list):
+                    # Chat format: list of messages
+                    ids = self.tokenizer.apply_chat_template(raw_prompt, tokenize=True, add_generation_prompt=True)
+                else:
+                    ids = self.tokenizer.encode(raw_prompt)
+                all_ids.append(ids)
+
+            max_len = max(len(ids) for ids in all_ids)
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            input_ids = torch.full((len(all_ids), max_len), pad_id, dtype=torch.long)
+            attention_mask = torch.zeros_like(input_ids)
+            for i, ids in enumerate(all_ids):
+                input_ids[i, -len(ids):] = torch.tensor(ids)  # left-pad
+                attention_mask[i, -len(ids):] = 1
+            position_ids = attention_mask.cumsum(dim=-1) - 1
+            position_ids.clamp_(min=0)
+
+            batch = DataProto.from_dict(tensors={
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            })
+            batch_padded, pad_size = pad_dataproto_to_divisor(batch, self.ref_policy_wg.world_size)
+            ref_embs_padded = self._compute_ref_embeddings(batch_padded)
+            ref_embs = unpad_dataproto(ref_embs_padded, pad_size=pad_size)
+            self._logo_meta_store.set_embeddings(chunk, ref_embs.batch["ref_embeddings"])
+
+        print(f"[LOGO] Embedding computation complete for {len(missing)} prompts.")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1520,6 +1647,10 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            # LOGO: compute embeddings for Lake prompts before sampler iterates
+            if hasattr(self, "_logo_meta_store"):
+                self._compute_missing_logo_embeddings()
+
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -1611,6 +1742,10 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # LOGO: compute embeddings for new prompts
+                    self._store_logo_embeddings(batch)
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),

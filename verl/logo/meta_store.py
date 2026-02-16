@@ -17,19 +17,20 @@ class PromptMetaStore:
     - Memory: Prompts in ``_store`` with rollout data (used for everything)
     - Lake: Prompts registered but not yet in ``_store`` (scored via RAG miner)
 
-    For Bayesian mode, preflight adds one observation on top of the prior
-    (prior + 1 sample).  Natural decay downweights this during training.
-    For EMA mode, preflight is skipped (single-sample EMA is just noise).
+    Entries start with no prior (alpha=0, beta=0).  The first observation
+    (preflight or training) defines the value directly: V = reward.
+    Subsequent observations blend via decay.
 
     Supports two value tracking modes:
     - "bayesian": Tracks Beta(alpha, beta) distribution, V(x) = alpha / (alpha + beta)
     - "ema": Tracks simple exponential moving average V(x)
     """
 
-    # Hardcoded priors
-    ALPHA_INIT = 1.0  # Beta distribution prior alpha (bayesian mode)
-    BETA_INIT = 1.0   # Beta distribution prior beta (bayesian mode)
-    VALUE_INIT = 0.5   # Initial value estimate (ema mode)
+    # Entry initialization: no prior for Bayesian — first observation defines the distribution.
+    # Lake prompts (never visited) use VALUE_INIT as a neutral default.
+    ALPHA_INIT = 0.0   # Bayesian entries start empty (no pseudo-observations)
+    BETA_INIT = 0.0    # Bayesian entries start empty
+    VALUE_INIT = 0.5   # Default value for Lake queries and initial v_old
 
     def __init__(self, mode: str = "bayesian"):
         if mode not in ("bayesian", "ema"):
@@ -40,6 +41,7 @@ class PromptMetaStore:
         self.value_init = self.VALUE_INIT
         self._store: Dict[str, dict] = {}
         self._all_prompt_ids: List[str] = []
+        self._embeddings: Dict[str, torch.Tensor] = {}  # prompt_id -> embedding (works for Memory AND Lake)
 
         # Step-level accumulators (reset each update() call, read by get_statistics)
         self._last_update_metrics: Dict[str, float] = {}
@@ -66,28 +68,20 @@ class PromptMetaStore:
         return [pid for pid in self._all_prompt_ids if pid not in store_set]
 
     def _fresh_entry(self) -> dict:
-        """Create a fresh entry with configured priors."""
-        if self.mode == "bayesian":
-            a, b = self.alpha_init, self.beta_init
-            return {
-                "alpha": a,
-                "beta": b,
-                "value": a / (a + b),
-                "n_obs": 0,
-                "last_step": 0,
-                "last_logprob": 0.0,
-                "embedding": None,
-            }
-        else:  # ema
-            return {
-                "alpha": 0.0,
-                "beta": 0.0,
-                "value": self.value_init,
-                "n_obs": 0,
-                "last_step": 0,
-                "last_logprob": 0.0,
-                "embedding": None,
-            }
+        """Create a fresh entry with no prior.
+
+        For Bayesian mode: alpha=0, beta=0 so the first observation(s)
+        define the distribution entirely (no Beta(1,1) pseudo-counts).
+        For EMA mode: starts at VALUE_INIT.
+        """
+        return {
+            "alpha": 0.0,
+            "beta": 0.0,
+            "value": self.value_init,  # placeholder v_old for first update
+            "n_obs": 0,
+            "last_step": 0,
+            "last_logprob": 0.0,
+        }
 
     def _lazy_initialize(self, prompt_id: str):
         """Lazily add a prompt to the store upon first visit."""
@@ -108,26 +102,28 @@ class PromptMetaStore:
         """Return value estimate for each prompt.
 
         Memory prompts: return stored value.
-        Lake prompts: return prior.
+        Lake prompts: return VALUE_INIT (neutral 0.5).
         """
-        prior = self.alpha_init / (self.alpha_init + self.beta_init) if self.mode == "bayesian" else self.value_init
         values = []
         for pid in prompt_ids:
             entry = self._store.get(pid)
             if entry is None:
-                values.append(prior)
+                values.append(self.value_init)
             else:
                 values.append(entry["value"])
         return torch.tensor(values, dtype=torch.float32)
 
     def get_alpha_beta(self, prompt_ids: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return alpha/beta parameters (only meaningful in bayesian mode)."""
+        """Return alpha/beta parameters (only meaningful in bayesian mode).
+
+        Lake prompts return (0, 0) — no prior information.
+        """
         alphas, betas = [], []
         for pid in prompt_ids:
             entry = self._store.get(pid)
             if entry is None:
-                alphas.append(self.alpha_init)
-                betas.append(self.beta_init)
+                alphas.append(0.0)
+                betas.append(0.0)
             else:
                 if self.mode == "bayesian":
                     alphas.append(entry["alpha"])
@@ -142,7 +138,7 @@ class PromptMetaStore:
         """Return variance/uncertainty estimate for each prompt.
 
         Bayesian: Beta distribution variance = ab / ((a+b)^2 (a+b+1))
-        EMA: V(1-V) as simple uncertainty proxy
+        Uninitialised (alpha=beta=0) or EMA: V(1-V) as simple proxy
         """
         values = self.get_value(prompt_ids).numpy()
         if self.mode == "bayesian":
@@ -150,7 +146,13 @@ class PromptMetaStore:
             alphas_np = alphas.numpy()
             betas_np = betas.numpy()
             ab_sum = alphas_np + betas_np
-            variance = (alphas_np * betas_np) / (ab_sum ** 2 * (ab_sum + 1))
+            # For uninitialised entries (alpha=beta=0), fall back to V*(1-V)
+            valid = ab_sum > 0
+            variance = np.where(
+                valid,
+                (alphas_np * betas_np) / (ab_sum ** 2 * (ab_sum + 1)),
+                values * (1.0 - values),
+            )
         else:
             variance = values * (1.0 - values)
         return torch.tensor(variance, dtype=torch.float32)
@@ -223,8 +225,12 @@ class PromptMetaStore:
                 entry["beta"] = max(new_beta, 0.01)
                 entry["value"] = entry["alpha"] / (entry["alpha"] + entry["beta"])
             else:  # ema
-                v_new = decay * v_old + (1.0 - decay) * r_bar
-                entry["value"] = np.clip(v_new, 0.0, 1.0)
+                if entry["n_obs"] == 0:
+                    # First observation: set value directly from reward
+                    entry["value"] = np.clip(r_bar, 0.0, 1.0)
+                else:
+                    v_new = decay * v_old + (1.0 - decay) * r_bar
+                    entry["value"] = np.clip(v_new, 0.0, 1.0)
 
             v_new = entry["value"]
             uncertainties.append(math.sqrt(v_new * (1.0 - v_new)))
@@ -254,7 +260,6 @@ class PromptMetaStore:
         current_step: int,
         rho: float = 1.0,
         staleness_bonus: float = 0.01,
-        epsilon: float = 0.1,
         lake_value_estimates: Optional[Dict[str, float]] = None,
     ) -> torch.Tensor:
         """Priority score for prompt sampling.
@@ -265,17 +270,16 @@ class PromptMetaStore:
             Exploration comes from posterior width: uncertain prompts produce
             more variable p_tilde samples -> occasionally high scores.
 
-        EMA mode (epsilon-greedy):
-            With probability epsilon: S = uniform random in [0, 1] (explore).
-            Otherwise: S = sqrt(V(1-V)) + rho * |V - e^{-NLL_last}| + staleness.
+        EMA mode (deterministic):
+            S = sqrt(V(1-V)) + rho * |V - e^{-NLL_last}| + staleness.
+            (Exploration handled by sampler-level epsilon-greedy, not here.)
 
-        Lake prompts: variance from RAG-extrapolated V (or prior) + staleness.
+        Lake prompts with kNN estimates: variance from extrapolated V + staleness.
+        Lake prompts without estimates: staleness only (low priority).
         Empty store: uniform scores (stochastic strategy).
         """
         if not self._store:
             return torch.ones(len(prompt_ids), dtype=torch.float32)
-
-        prior = self.alpha_init / (self.alpha_init + self.beta_init) if self.mode == "bayesian" else self.value_init
 
         scores = []
         for pid in prompt_ids:
@@ -286,10 +290,6 @@ class PromptMetaStore:
                     # Thompson sampling: wider posterior -> more exploration
                     p = float(np.random.beta(entry["alpha"], entry["beta"]))
                 else:
-                    # Epsilon-greedy: occasionally explore randomly
-                    if np.random.rand() < epsilon:
-                        scores.append(float(np.random.rand()))
-                        continue
                     p = entry["value"]
 
                 var_score = math.sqrt(p * (1.0 - p))
@@ -298,11 +298,16 @@ class PromptMetaStore:
                 staleness = staleness_bonus * (current_step - entry["last_step"])
                 scores.append(var_score + rho * conf_gap + staleness)
             else:
-                # Lake prompt: variance + staleness (no logprob available)
-                v = lake_value_estimates.get(pid, prior) if lake_value_estimates else prior
-                var_score = math.sqrt(v * (1.0 - v))
+                # Lake prompt: priority only from kNN estimates or staleness.
+                # No blind variance bonus — uninformed prompts get low priority.
                 staleness = staleness_bonus * current_step
-                scores.append(var_score + staleness)
+                if lake_value_estimates and pid in lake_value_estimates:
+                    v = lake_value_estimates[pid]
+                    var_score = math.sqrt(v * (1.0 - v))
+                    scores.append(var_score + staleness)
+                else:
+                    # No information at all — only staleness drives priority
+                    scores.append(staleness)
 
         return torch.tensor(scores, dtype=torch.float32)
 
@@ -313,22 +318,25 @@ class PromptMetaStore:
     def set_embeddings(self, prompt_ids: List[str], embeddings: torch.Tensor):
         """Store prompt embeddings (detached, on CPU).
 
-        Only stores for prompts currently in _store.
+        Works for any registered prompt (Memory or Lake).
         """
         embeddings_cpu = embeddings.detach().cpu()
         for i, pid in enumerate(prompt_ids):
-            if pid in self._store:
-                self._store[pid]["embedding"] = embeddings_cpu[i]
+            self._embeddings[pid] = embeddings_cpu[i]
 
     def get_embeddings(self, prompt_ids: List[str]) -> Optional[torch.Tensor]:
         """Retrieve embeddings; returns None if any are missing."""
         embs = []
         for pid in prompt_ids:
-            entry = self._store.get(pid)
-            if entry is None or entry["embedding"] is None:
+            emb = self._embeddings.get(pid)
+            if emb is None:
                 return None
-            embs.append(entry["embedding"])
+            embs.append(emb)
         return torch.stack(embs)
+
+    def prompts_without_embeddings(self) -> List[str]:
+        """Return registered prompt IDs that don't have embeddings yet."""
+        return [pid for pid in self._all_prompt_ids if pid not in self._embeddings]
 
     # ------------------------------------------------------------------
     # Legacy aliases
@@ -351,12 +359,14 @@ class PromptMetaStore:
             "mode": self.mode,
             "all_prompt_ids": self._all_prompt_ids,
             "store": dict(self._store),
+            "embeddings": dict(self._embeddings),
         }
 
     def load_state_dict(self, sd: dict):
         self.mode = sd.get("mode", "bayesian")
         self._all_prompt_ids = sd.get("all_prompt_ids", [])
         self._store = sd["store"]
+        self._embeddings = sd.get("embeddings", {})
 
     # ------------------------------------------------------------------
     # Statistics (for logging)

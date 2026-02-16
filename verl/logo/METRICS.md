@@ -33,6 +33,22 @@ where `lambda = exp(-sigma_group^2 / tau)` (adaptive).
 
 ## 2. Stored Value Health
 
+Bayesian entries start with `alpha=0, beta=0` — no prior. The first observation
+(preflight or training) defines the distribution directly.
+
+**Preflight** shrinks the reward toward a neutral center proportionally to model uncertainty:
+```
+V_init = blend + (R - blend) * exp(mean_logprob)
+```
+where `blend = 0.5` (configurable) and `mean_logprob` is the average per-token log probability.
+When the model is confident (`exp(mean_logprob) ≈ 1`), `V_init ≈ R`.
+When the model is uncertain (`exp(mean_logprob) ≈ 0`), `V_init ≈ blend` (neutral).
+This is especially important for fixed (non-adaptive) decay, where the initial value persists.
+If logprobs are unavailable, falls back to raw reward.
+
+**Training** uses raw rewards (multi-sample, less noisy). Adaptive decay corrects
+any remaining preflight bias on subsequent visits.
+
 ### Batch-level (V_stored vs actual reward on current batch)
 
 From `ray_trainer.py`:
@@ -80,12 +96,22 @@ From `meta_store.py` `get_statistics()`:
 
 ### Priority scores (from `sampler.py`)
 
-Recomputed each epoch via `compute_sampling_scores`. For Bayesian mode (Thompson sampling):
+Recomputed each epoch via `compute_sampling_scores`.
 
+**Memory prompts** (Bayesian mode, Thompson sampling):
 ```
 p_tilde ~ Beta(alpha, beta)
 S = sqrt(p_tilde * (1 - p_tilde)) + rho * |p_tilde - exp(logprob_last)| + staleness_bonus * delta_t
 ```
+
+**Memory prompts** (EMA mode): same formula but `p = V` deterministic (no Thompson noise).
+
+**Lake prompts with kNN estimates**: `S = sqrt(v_knn * (1 - v_knn)) + staleness_bonus * current_step`
+**Lake prompts without estimates**: `S = staleness_bonus * current_step` (low priority — no blind variance bonus)
+
+**Sampler-level epsilon-greedy**: After scores are computed, each yielded index is replaced
+with a uniformly random index with probability `epsilon`. This is the primary mechanism for
+Lake exploration (prompts that have no score information). Default `epsilon = 0.1`.
 
 | Metric | Tag | Formula | What it tells you |
 |--------|-----|---------|-------------------|

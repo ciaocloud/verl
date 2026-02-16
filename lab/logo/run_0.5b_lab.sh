@@ -12,9 +12,8 @@ DATE=$(date +%m%d%H)  # MMDDHH format (e.g., 012014)
 export N_GPUS=1
 export BASE_MODEL="Qwen/Qwen2.5-${MODEL_SIZE}-Instruct"
 export DATA_DIR="/workspace/data"
-export PROJ_NAME='verl-lotis'
-# export EXP_NAME="TOKMLP-1e-3-${MODEL_SIZE}-${DATASET}-${DATE}"
-export EXP_NAME="LENRBF-1e-2-${MODEL_SIZE}-${DATASET}-${DATE}"
+export PROJ_NAME='verl-logo'
+export EXP_NAME="LOGO-${MODEL_SIZE}-${DATASET}-${DATE}"
 
 # Use verl's default checkpoint path
 export CKPT_DIR="checkpoints/${PROJ_NAME}/${EXP_NAME}"
@@ -33,15 +32,16 @@ nohup python3 -m verl.trainer.main_ppo \
     custom_reward_function.path=verl/lab/reward.py \
     custom_reward_function.name=compute_score \
     algorithm.adv_estimator=logo \
-    +algorithm.logo.alpha_init=1.0 \
-    +algorithm.logo.beta_init=1.0 \
-    +algorithm.logo.advantage.tau=0.1 \
-    +algorithm.logo.advantage.adaptive_lambda=true \
-    +algorithm.logo.decay.mode=adaptive \
-    +algorithm.logo.decay.gamma=0.99 \
-    +algorithm.logo.decay.sensitivity=2.0 \
-    +algorithm.logo.sampling.rho=1.0 \
-    +algorithm.logo.sampling.staleness_bonus=0.01 \
+    algorithm.logo.value_mode=bayesian \
+    algorithm.logo.sampling.rho=1.0 \
+    algorithm.logo.sampling.staleness_bonus=0.01 \
+    algorithm.logo.sampling.epsilon=0.1 \
+    algorithm.logo.advantage.tau=0.1 \
+    algorithm.logo.decay.mode=adaptive \
+    algorithm.logo.decay.gamma=0.99 \
+    algorithm.logo.decay.sensitivity=2.0 \
+    algorithm.logo.preflight.enable=true \
+    algorithm.logo.preflight.sample_fraction=1.0 \
     algorithm.use_kl_in_reward=False \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \

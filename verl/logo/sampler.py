@@ -111,18 +111,28 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
 
         idx_list = indices.tolist()
 
-        # Sampler-level epsilon-greedy: randomly replace some indices
+        # Sampler-level epsilon-greedy: swap selected positions with
+        # random unused indices to guarantee no duplicates.
         eps = self.sampling_cfg.epsilon if self.sampling_cfg else 0.1
         if eps > 0:
+            available = list(set(range(self.n_prompts)) - set(idx_list))
+            np.random.shuffle(available)
+            avail_ptr = 0
             for i in range(len(idx_list)):
                 if np.random.rand() < eps:
-                    idx_list[i] = np.random.randint(0, self.n_prompts)
+                    if avail_ptr < len(available):
+                        # Replace with an unused index; recycle the old one
+                        available.append(idx_list[i])
+                        idx_list[i] = available[avail_ptr]
+                        avail_ptr += 1
+                    else:
+                        # All indices in use (full sampling) — swap positions
+                        j = np.random.randint(0, len(idx_list))
+                        idx_list[i], idx_list[j] = idx_list[j], idx_list[i]
 
-        # Reset per-epoch; count lazily as DataLoader consumes indices
+        # Reset per-epoch; actual counting happens in update() per step
         self._sample_counts = Counter()
-        for idx in idx_list:
-            self._sample_counts[idx] += 1
-            yield idx
+        yield from idx_list
 
     # ------------------------------------------------------------------
     # Curriculum callback (called by trainer at end of each step)
@@ -141,6 +151,11 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             return
 
         self.current_step += 1
+
+        # Track unique prompts actually trained on this step
+        # (deduplicate because rollout.n > 1 repeats prompt_ids)
+        if "logo_prompt_id" in batch.non_tensor_batch:
+            self._sample_counts.update(set(batch.non_tensor_batch["logo_prompt_id"].tolist()))
 
         # --- extract sequence-level reward ---
         if "token_level_rewards" in batch.batch.keys():
@@ -217,8 +232,16 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
     # ------------------------------------------------------------------
 
     def get_statistics(self) -> dict:
-        """Return priority score and sample count metrics."""
+        """Return priority score and sample count metrics.
+
+        Recomputes scores from current meta-store state so metrics reflect
+        step-by-step updates, not just the stale epoch-start snapshot.
+        """
         stats = {}
+
+        # Recompute scores from current meta-store state
+        if self.meta_store is not None:
+            self._recompute_scores()
 
         # Priority score metrics
         if self._scores is not None and len(self._scores) > 0:

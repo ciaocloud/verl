@@ -41,7 +41,7 @@ nohup python3 -m verl.trainer.main_ppo \
     algorithm.logo.decay.gamma=0.99 \
     algorithm.logo.decay.sensitivity=2.0 \
     algorithm.logo.preflight.enable=true \
-    algorithm.logo.preflight.sample_fraction=1.0 \
+    algorithm.logo.preflight.sample_fraction=0.3 \
     algorithm.use_kl_in_reward=False \
     data.train_files=$TRAIN_DATA \
     data.val_files=$VAL_DATA \

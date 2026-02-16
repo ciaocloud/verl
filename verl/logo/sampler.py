@@ -50,6 +50,8 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
 
         # Per-prompt cumulative sample counts (how many times each index was yielded)
         self._sample_counts: Counter = Counter()
+        # Prompt IDs from the last batch (for batch-level metrics)
+        self._last_batch_prompt_ids: Optional[list] = None
 
     # ------------------------------------------------------------------
     # Setup (called by trainer before fit)
@@ -176,6 +178,9 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         else:
             return
 
+        # Save unique prompt IDs for batch-level metrics in get_statistics()
+        self._last_batch_prompt_ids = list(dict.fromkeys(prompt_ids))
+
         # --- update meta-store ---
         dcfg = self.decay_cfg
         self.meta_store.update(
@@ -267,6 +272,24 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             bot_k = torch.topk(scores, k=k, largest=False).values.mean().item()
             stats["logo/priority_top10pct"] = top_k
             stats["logo/priority_bot10pct"] = bot_k
+
+        # Batch-level priority metrics (scores for prompts in the current step's batch)
+        if self._last_batch_prompt_ids and self.meta_store is not None:
+            scfg = self.sampling_cfg
+            lake_values = self.stochastic_miner.value_cache if self.stochastic_miner else None
+            batch_scores = self.meta_store.compute_sampling_scores(
+                prompt_ids=self._last_batch_prompt_ids,
+                current_step=self.current_step,
+                rho=scfg.rho if scfg else 1.0,
+                staleness_bonus=scfg.staleness_bonus if scfg else 0.01,
+                lake_value_estimates=lake_values,
+            )
+            stats.update({
+                "logo/batch_priority_mean": batch_scores.mean().item(),
+                "logo/batch_priority_std": batch_scores.std().item(),
+                "logo/batch_priority_max": batch_scores.max().item(),
+                "logo/batch_priority_min": batch_scores.min().item(),
+            })
 
         # Sample count metrics (over visited prompts only)
         if self._sample_counts:

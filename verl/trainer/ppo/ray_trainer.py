@@ -348,6 +348,7 @@ class RayPPOTrainer:
         if self.config.algorithm.get("adv_estimator", "") == "logo":
             self._init_logo(train_dataset)
             train_dataset = self._logo_dataset  # use wrapped dataset
+            self.train_dataset = train_dataset   # update instance attr so DataLoader uses it
             train_sampler = self._logo_sampler   # use curriculum sampler
 
         if train_sampler is None:
@@ -455,6 +456,10 @@ class RayPPOTrainer:
                 item = self._ds[idx]
                 item["logo_prompt_id"] = str(idx)
                 return item
+
+            def __getattr__(self, name):
+                # Delegate unknown attributes to the underlying dataset
+                return getattr(self._ds, name)
 
         self._logo_dataset = _IndexedDataset(train_dataset)
 

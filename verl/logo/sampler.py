@@ -11,7 +11,7 @@ from omegaconf import DictConfig
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.logo.config import DecayConfig, LOGOConfig, SamplingConfig
+from verl.logo.config import DecayConfig, LOGOConfig, RAGMinerConfig, SamplingConfig
 from verl.logo.meta_store import PromptMetaStore
 
 
@@ -41,7 +41,10 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         self.meta_store: Optional[PromptMetaStore] = None
         self.sampling_cfg: Optional[SamplingConfig] = None
         self.decay_cfg: Optional[DecayConfig] = None
+        self.rag_miner_cfg: Optional[RAGMinerConfig] = None
+        self.stochastic_miner = None  # Optional[StochasticMiner]
         self.current_step: int = 0
+        self._epoch: int = 0
         self._scores: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
@@ -52,19 +55,20 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         self,
         meta_store: PromptMetaStore,
         logo_config: LOGOConfig,
+        stochastic_miner=None,
     ):
-        """Attach the meta-store and config after construction.
+        """Attach the meta-store, config, and optional miner after construction.
 
         Registers all prompt IDs with the meta_store to define Memory/Lake topology.
         """
         self.meta_store = meta_store
         self.sampling_cfg = logo_config.sampling
         self.decay_cfg = logo_config.decay
+        self.rag_miner_cfg = logo_config.rag_miner
+        self.stochastic_miner = stochastic_miner
 
         # Register all prompts with meta_store (defines Lake initially)
-        # Extract prompt IDs from data_source if possible
-        all_ids = [str(i) for i in range(self.n_prompts)]  # fallback: use indices
-        # TODO: If data_source has explicit prompt IDs, extract them here
+        all_ids = [str(i) for i in range(self.n_prompts)]
         self.meta_store.register_dataset(all_ids)
 
     # ------------------------------------------------------------------
@@ -81,6 +85,8 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             yield from range(self.n_prompts)
             return
 
+        self._epoch += 1
+        self._refresh_lake_cache()
         self._recompute_scores()
 
         if self.sampling_cfg is not None and self.sampling_cfg.top_k is not None:
@@ -143,9 +149,27 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             gamma_clip_max=dcfg.gamma_clip_max if dcfg else 0.95,
         )
 
+        # Clean up miner cache: prompts that moved from Lake to Memory
+        if self.stochastic_miner is not None:
+            self.stochastic_miner.clear_moved_to_memory()
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _refresh_lake_cache(self):
+        """Run the stochastic miner to extrapolate values for Lake prompts.
+
+        Called once per epoch before score computation.  Respects
+        ``rag_miner.sample_freq`` — only runs every N epochs.
+        """
+        if self.stochastic_miner is None:
+            return
+        rcfg = self.rag_miner_cfg
+        freq = rcfg.sample_freq if rcfg else 5
+        if self._epoch % freq != 0:
+            return
+        self.stochastic_miner.sample_and_extrapolate()
 
     def _recompute_scores(self):
         """Recompute Thompson-sampling priority scores for all prompts."""
@@ -154,9 +178,12 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             self._scores = torch.ones(self.n_prompts)
             return
         scfg = self.sampling_cfg
+        lake_values = self.stochastic_miner.value_cache if self.stochastic_miner else None
         self._scores = self.meta_store.compute_sampling_scores(
             prompt_ids=all_ids,
             current_step=self.current_step,
             rho=scfg.rho if scfg else 1.0,
             staleness_bonus=scfg.staleness_bonus if scfg else 0.01,
+            epsilon=scfg.epsilon if scfg else 0.1,
+            lake_value_estimates=lake_values,
         )

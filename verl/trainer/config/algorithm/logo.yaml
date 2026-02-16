@@ -49,6 +49,6 @@ logo:
     sample_freq: 5
 
   preflight:
-    enable: false
+    enable: true
     sample_fraction: 1.0
     alpha_blend: 0.5

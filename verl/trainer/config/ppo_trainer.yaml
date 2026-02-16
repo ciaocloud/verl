@@ -214,7 +214,7 @@ algorithm:
       _target_: verl.logo.config.PreFlightConfig
 
       # Whether to run pre-flight epoch
-      enable: false
+      enable: true
 
       # Fraction of prompts to scout
       sample_fraction: 1.0

@@ -12,6 +12,7 @@ class SamplingConfig(BaseConfig):
     rho: float = 1.0  # confidence calibration weight in priority score
     top_k: Optional[int] = None  # None = weighted multinomial over all prompts
     staleness_bonus: float = 0.01  # bonus per step since last visit
+    epsilon: float = 0.1  # epsilon-greedy exploration rate (EMA mode only)
 
 
 @dataclass
@@ -44,7 +45,7 @@ class RAGMinerConfig(BaseConfig):
 @dataclass
 class PreFlightConfig(BaseConfig):
     """Config for pre-flight initialization epoch."""
-    enable: bool = False
+    enable: bool = True
     sample_fraction: float = 1.0  # fraction of prompts to scout
     alpha_blend: float = 0.5  # V_0 = blend*R + (1-blend)*P_ref
 

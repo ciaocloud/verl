@@ -47,10 +47,9 @@ class StochasticMiner:
         return max(1, int(ratio * base_size))
 
     def clear_moved_to_memory(self):
-        """Clear cache entries for prompts that moved from Lake to Memory."""
-        memory_set = set(self.meta_store.memory())
+        """Clear cache entries for prompts that moved out of Lake (into store)."""
         for pid in list(self.value_cache.keys()):
-            if pid in memory_set:
+            if pid in self.meta_store._store:
                 self.value_cache.pop(pid)
 
     # ------------------------------------------------------------------
@@ -60,13 +59,15 @@ class StochasticMiner:
     def sample_and_extrapolate(self, n_samples: Optional[int] = None) -> Dict[str, float]:
         """Sample from Lake and extrapolate values via KNN on embeddings.
 
+        Uses Memory prompts as RAG source neighbors.
+
         Returns:
             Dict mapping lake prompt_id -> guessed value (also stored in cache).
         """
         lake = self.meta_store.lake()
-        memory = self.meta_store.memory()
+        memory_ids = self.meta_store.memory()
 
-        if not lake or not memory:
+        if not lake or not memory_ids:
             return {}
 
         if n_samples is None:
@@ -79,7 +80,6 @@ class StochasticMiner:
 
         # get embeddings
         lake_embs = self.meta_store.get_embeddings(lake_ids)
-        memory_ids = memory
         memory_embs = self.meta_store.get_embeddings(memory_ids)
 
         if lake_embs is None or memory_embs is None:

@@ -407,10 +407,11 @@ class RayPPOTrainer:
     # ------------------------------------------------------------------
 
     def _init_logo(self, train_dataset):
-        """Set up LOGO meta-store, dataset wrapper, and curriculum sampler."""
+        """Set up LOGO meta-store, dataset wrapper, stochastic miner, and curriculum sampler."""
         import verl.logo.advantage  # registers "logo" advantage estimator
         from verl.logo.config import LOGOConfig
         from verl.logo.meta_store import PromptMetaStore
+        from verl.logo.rag_miner import StochasticMiner
         from verl.logo.sampler import LOGOCurriculumSampler
         from omegaconf import OmegaConf
 
@@ -432,7 +433,17 @@ class RayPPOTrainer:
         )
         # Note: prompt_ids are registered via sampler.configure() below (lazy init)
 
-        # 2. Thin dataset wrapper that injects persistent prompt IDs
+        # 2. Stochastic miner (RAG-based value extrapolation for Lake prompts)
+        miner = None
+        if logo_cfg.rag_miner.enable:
+            miner = StochasticMiner(
+                meta_store=self._logo_meta_store,
+                similarity_threshold=logo_cfg.rag_miner.similarity_threshold,
+                k_neighbors=logo_cfg.rag_miner.k_neighbors,
+            )
+        self._logo_miner = miner
+
+        # 3. Thin dataset wrapper that injects persistent prompt IDs
         class _IndexedDataset:
             def __init__(self, ds):
                 self._ds = ds
@@ -447,7 +458,7 @@ class RayPPOTrainer:
 
         self._logo_dataset = _IndexedDataset(train_dataset)
 
-        # 3. Curriculum sampler
+        # 4. Curriculum sampler
         self._logo_sampler = LOGOCurriculumSampler(
             data_source=self._logo_dataset,
             data_config=self.config.data,
@@ -455,15 +466,17 @@ class RayPPOTrainer:
         self._logo_sampler.configure(
             meta_store=self._logo_meta_store,
             logo_config=logo_cfg,
+            stochastic_miner=miner,
         )
 
     def _logo_preflight(self):
-        """Run pre-flight epoch: rollout 1 sample per prompt to seed meta-store values.
+        """Run pre-flight epoch: rollout 1 sample per prompt to seed meta-store.
 
-        Iterates through the training data, generates one response per prompt using
-        the current policy, computes rewards, and initialises the Bayesian value
-        estimates accordingly.  Skipped when ``algorithm.logo.preflight.enable`` is
-        False (default).
+        For Bayesian mode: adds one observation per prompt on top of the prior.
+            Natural decay downweights this during training.
+        For EMA mode: skipped (single-sample EMA is just noise).
+
+        Skipped when ``algorithm.logo.preflight.enable`` is False.
         """
         from verl.logo.config import LOGOConfig
         from omegaconf import OmegaConf
@@ -477,9 +490,12 @@ class RayPPOTrainer:
         if not logo_cfg.preflight.enable:
             return
 
+        if logo_cfg.value_mode != "bayesian":
+            print("[LOGO] Pre-flight skipped (only useful for Bayesian mode).")
+            return
+
         print("[LOGO] Running pre-flight epoch ...")
 
-        alpha_blend = logo_cfg.preflight.alpha_blend
         sample_fraction = logo_cfg.preflight.sample_fraction
 
         total_updated = 0
@@ -497,7 +513,6 @@ class RayPPOTrainer:
 
             gen_batch = self._get_gen_batch(batch)
             gen_batch.meta_info["global_steps"] = 0
-            # n=1 rollout: no repeat needed
             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
             batch = batch.union(gen_batch_output)
@@ -510,7 +525,8 @@ class RayPPOTrainer:
             response_mask = compute_response_mask(batch)
             seq_rewards = (reward_tensor * response_mask).sum(dim=-1)  # (bs,)
 
-            # Update meta-store with initial values
+            # Normal update: adds observation on top of prior (prior + 1 sample).
+            # During training, decay naturally downweights this initial observation.
             if "logo_prompt_id" in batch.non_tensor_batch:
                 prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
                 self._logo_meta_store.update(
@@ -518,7 +534,8 @@ class RayPPOTrainer:
                     rewards=seq_rewards,
                     step=0,
                     decay_mode="fixed",
-                    gamma=1.0,  # no decay for initialization
+                    gamma=1.0,  # no decay for first observation
+                    gamma_clip_max=1.0,
                 )
                 total_updated += len(prompt_ids)
 
@@ -1833,9 +1850,11 @@ class RayPPOTrainer:
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
-                # LOGO: collect meta-store statistics
+                # LOGO: collect meta-store and miner statistics
                 if hasattr(self, "_logo_meta_store"):
                     metrics.update(self._logo_meta_store.get_statistics(current_step=self.global_steps))
+                    if getattr(self, "_logo_miner", None) is not None:
+                        metrics.update(self._logo_miner.get_statistics())
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

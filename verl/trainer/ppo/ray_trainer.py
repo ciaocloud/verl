@@ -520,7 +520,10 @@ class RayPPOTrainer:
             }
 
             gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, size_divisor)
-            gen_batch_output_padded = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
+            if not self.async_rollout_mode:
+                gen_batch_output_padded = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
+            else:
+                gen_batch_output_padded = self.async_rollout_manager.generate_sequences(gen_batch_padded)
             gen_batch_output = unpad_dataproto(gen_batch_output_padded, pad_size=pad_size)
 
             batch = batch.union(gen_batch_output)

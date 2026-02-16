@@ -492,36 +492,45 @@ class RayPPOTrainer:
         print("[LOGO] Running pre-flight epoch ...")
 
         sample_fraction = logo_cfg.preflight.sample_fraction
+        size_divisor = (
+            self.actor_rollout_wg.world_size
+            if not self.async_rollout_mode
+            else self.config.actor_rollout_ref.rollout.agent.num_workers
+        )
 
         total_updated = 0
         for batch_dict in self.train_dataloader:
             batch = DataProto.from_single_dict(batch_dict)
 
-            # Skip prompts based on sample_fraction
             if sample_fraction < 1.0 and np.random.rand() > sample_fraction:
                 continue
 
-            # Assign uid for grouping (n=1 so each prompt is its own group)
             batch.non_tensor_batch["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
             )
 
             gen_batch = self._get_gen_batch(batch)
-            gen_batch.meta_info["global_steps"] = 0
-            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+            gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": True,
+                "validate": False,
+                "global_steps": 0,
+            }
+
+            gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, size_divisor)
+            gen_batch_output_padded = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
+            gen_batch_output = unpad_dataproto(gen_batch_output_padded, pad_size=pad_size)
 
             batch = batch.union(gen_batch_output)
 
-            # Compute reward
             reward_tensor, _ = self._compute_or_extract_reward(batch, reward_fn=self.reward_fn)
             batch.batch["token_level_scores"] = reward_tensor
 
-            # Sequence-level reward
             response_mask = compute_response_mask(batch)
-            seq_rewards = (reward_tensor * response_mask).sum(dim=-1)  # (bs,)
+            seq_rewards = (reward_tensor * response_mask).sum(dim=-1)
 
-            # Normal update: adds observation on top of prior (prior + 1 sample).
-            # During training, decay naturally downweights this initial observation.
             if "logo_prompt_id" in batch.non_tensor_batch:
                 prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
                 self._logo_meta_store.update(
@@ -529,7 +538,7 @@ class RayPPOTrainer:
                     rewards=seq_rewards,
                     step=0,
                     decay_mode="fixed",
-                    gamma=1.0,  # no decay for first observation
+                    gamma=1.0,
                     gamma_clip_max=1.0,
                 )
                 total_updated += len(prompt_ids)
@@ -1466,10 +1475,6 @@ class RayPPOTrainer:
         self._load_checkpoint()
         self.checkpoint_manager.update_weights()
 
-        # LOGO: pre-flight epoch to seed meta-store with initial value estimates
-        if hasattr(self, "_logo_meta_store"):
-            self._logo_preflight()
-
         current_epoch = self.global_steps // len(self.train_dataloader)
 
         # perform validation before training
@@ -1481,6 +1486,10 @@ class RayPPOTrainer:
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
+
+        # LOGO: pre-flight epoch to seed meta-store with initial value estimates
+        if hasattr(self, "_logo_meta_store"):
+            self._logo_preflight()
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)

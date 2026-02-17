@@ -34,12 +34,13 @@ class DecayConfig(BaseConfig):
 
 
 @dataclass
-class RAGMinerConfig(BaseConfig):
-    """Config for RAG-based stochastic miner."""
+class MinerConfig(BaseConfig):
+    """Config for candidate mining."""
     enable: bool = False
+    candidate_batch_size: int = 4096  # Lake candidates to scout per mine()
     similarity_threshold: float = 0.7
     k_neighbors: int = 5
-    sample_freq: int = 5  # sample from lake every N epochs
+    encoder_model: str = "all-MiniLM-L6-v2"  # sentence-transformers model
 
 
 @dataclass
@@ -59,5 +60,5 @@ class LOGOConfig(BaseConfig):
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     advantage: AdvantageConfig = field(default_factory=AdvantageConfig)
     decay: DecayConfig = field(default_factory=DecayConfig)
-    rag_miner: RAGMinerConfig = field(default_factory=RAGMinerConfig)
+    miner: MinerConfig = field(default_factory=MinerConfig)
     preflight: PreFlightConfig = field(default_factory=PreFlightConfig)

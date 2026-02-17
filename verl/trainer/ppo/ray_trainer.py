@@ -413,11 +413,11 @@ class RayPPOTrainer:
     # ------------------------------------------------------------------
 
     def _init_logo(self, train_dataset):
-        """Set up LOGO meta-store, dataset wrapper, stochastic miner, and curriculum sampler."""
+        """Set up LOGO meta-store, dataset wrapper, candidate miner, and curriculum sampler."""
         import verl.logo.advantage  # registers "logo" advantage estimator
         from verl.logo.config import LOGOConfig
         from verl.logo.meta_store import PromptMetaStore
-        from verl.logo.rag_miner import StochasticMiner
+        from verl.logo.rag_miner import RAGMiner
         from verl.logo.sampler import LOGOCurriculumSampler
         from omegaconf import OmegaConf
 
@@ -434,17 +434,7 @@ class RayPPOTrainer:
         self._logo_meta_store = PromptMetaStore(mode=logo_cfg.value_mode)
         # Note: prompt_ids are registered via sampler.configure() below (lazy init)
 
-        # 2. Stochastic miner (RAG-based value extrapolation for Lake prompts)
-        miner = None
-        if logo_cfg.rag_miner.enable:
-            miner = StochasticMiner(
-                meta_store=self._logo_meta_store,
-                similarity_threshold=logo_cfg.rag_miner.similarity_threshold,
-                k_neighbors=logo_cfg.rag_miner.k_neighbors,
-            )
-        self._logo_miner = miner
-
-        # 3. Thin dataset wrapper that injects persistent prompt IDs
+        # 2. Thin dataset wrapper that injects persistent prompt IDs
         class _IndexedDataset:
             def __init__(self, ds):
                 self._ds = ds
@@ -463,6 +453,23 @@ class RayPPOTrainer:
 
         self._logo_dataset = _IndexedDataset(train_dataset)
 
+        # 3. Candidate miner (kNN value extrapolation for Lake prompts)
+        miner = None
+        if logo_cfg.miner.enable:
+            # Precompute embeddings using lightweight sentence-transformer
+            self._precompute_logo_embeddings(
+                dataset=self._logo_dataset,
+                meta_store=self._logo_meta_store,
+                encoder_model=logo_cfg.miner.encoder_model,
+            )
+            miner = RAGMiner(
+                meta_store=self._logo_meta_store,
+                candidate_batch_size=logo_cfg.miner.candidate_batch_size,
+                similarity_threshold=logo_cfg.miner.similarity_threshold,
+                k_neighbors=logo_cfg.miner.k_neighbors,
+            )
+        self._logo_miner = miner
+
         # 4. Curriculum sampler
         self._logo_sampler = LOGOCurriculumSampler(
             data_source=self._logo_dataset,
@@ -471,7 +478,7 @@ class RayPPOTrainer:
         self._logo_sampler.configure(
             meta_store=self._logo_meta_store,
             logo_config=logo_cfg,
-            stochastic_miner=miner,
+            candidate_miner=miner,
         )
 
     def _logo_preflight(self):
@@ -549,9 +556,6 @@ class RayPPOTrainer:
             batch.batch["response_mask"] = response_mask
             seq_rewards = (reward_tensor * response_mask).sum(dim=-1)
 
-            # LOGO: compute embeddings for preflight prompts
-            self._store_logo_embeddings(batch)
-
             if "logo_prompt_id" in batch.non_tensor_batch:
                 prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
 
@@ -593,99 +597,62 @@ class RayPPOTrainer:
 
         print(f"[LOGO] Pre-flight complete: seeded {total_updated} prompt values.")
 
-    def _compute_ref_embeddings(self, batch: DataProto) -> DataProto:
-        """Compute reference-policy embeddings for a batch."""
-        return self.ref_policy_wg.compute_ref_embeddings(batch)
+    @staticmethod
+    def _precompute_logo_embeddings(dataset, meta_store, encoder_model: str = "all-MiniLM-L6-v2"):
+        """Precompute embeddings for all prompts using a lightweight sentence-transformer.
 
-    def _store_logo_embeddings(self, batch: DataProto):
-        """Compute and store ref-policy embeddings for prompts that don't have them yet.
+        This replaces the previous ref-policy embedding approach with a ~30M param
+        encoder that is ~1000x cheaper. The encoder is loaded, used, and deleted.
 
-        Deduplicates before the forward pass so each prompt is computed exactly once,
-        even when rollout.n > 1 causes repeated prompt IDs in the batch.
+        Args:
+            dataset: Dataset with ``raw_prompt`` or ``prompt`` fields.
+            meta_store: PromptMetaStore to store embeddings in.
+            encoder_model: sentence-transformers model name.
         """
-        if not hasattr(self, "_logo_meta_store") or not self.use_reference_policy:
-            return
-        if getattr(self, "_logo_miner", None) is None:
-            return  # embeddings only needed when RAG miner is enabled
-        if "logo_prompt_id" not in batch.non_tensor_batch:
-            return
-
-        prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
-
-        # Deduplicate: pick first occurrence of each prompt_id that lacks an embedding
-        seen = set()
-        unique_indices = []
-        unique_pids = []
-        for i, pid in enumerate(prompt_ids):
-            if pid not in seen and pid not in self._logo_meta_store._embeddings:
-                seen.add(pid)
-                unique_indices.append(i)
-                unique_pids.append(pid)
-        if not unique_pids:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            import warnings
+            warnings.warn(
+                "sentence-transformers not installed. LOGO miner embeddings will not be computed. "
+                "Install with: pip install sentence-transformers  (or pip install -e .[logo])"
+            )
             return
 
-        sub_batch = batch.select_idxs(unique_indices)
+        n = len(dataset)
+        all_ids = [str(i) for i in range(n)]
 
-        sub_batch_padded, pad_size = pad_dataproto_to_divisor(sub_batch, self.ref_policy_wg.world_size)
-        ref_embs_padded = self._compute_ref_embeddings(sub_batch_padded)
-        ref_embs = unpad_dataproto(ref_embs_padded, pad_size=pad_size)
+        # Extract text from all prompts
+        texts = []
+        for i in range(n):
+            item = dataset[i]
+            raw_prompt = item.get("raw_prompt") or item.get("prompt")
+            if isinstance(raw_prompt, list):
+                # Chat format: concatenate user message contents
+                parts = []
+                for msg in raw_prompt:
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            parts.append(content)
+                        elif isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    parts.append(block.get("text", ""))
+                                elif isinstance(block, str):
+                                    parts.append(block)
+                texts.append(" ".join(parts) if parts else str(raw_prompt))
+            elif isinstance(raw_prompt, str):
+                texts.append(raw_prompt)
+            else:
+                texts.append(str(raw_prompt))
 
-        self._logo_meta_store.set_embeddings(unique_pids, ref_embs.batch["ref_embeddings"])
-
-    def _compute_missing_logo_embeddings(self):
-        """Compute embeddings for prompts that don't have them yet.
-
-        Tokenizes prompts from the dataset and sends through the ref model.
-        Called before each epoch so the RAG miner can use embeddings.
-        Only runs when the RAG miner is enabled (embeddings have no other consumer).
-        """
-        if not hasattr(self, "_logo_meta_store") or not self.use_reference_policy:
-            return
-        if getattr(self, "_logo_miner", None) is None:
-            return  # embeddings only needed when RAG miner is enabled
-
-        missing = self._logo_meta_store.prompts_without_embeddings()
-        if not missing:
-            return
-
-        print(f"[LOGO] Computing embeddings for {len(missing)} prompts ...")
-
-        chunk_size = self.config.data.get("train_batch_size", 256)
-        for start in range(0, len(missing), chunk_size):
-            chunk = missing[start : start + chunk_size]
-            # Tokenize prompts from the dataset
-            all_ids = []
-            for pid in chunk:
-                item = self._logo_dataset[int(pid)]
-                raw_prompt = item.get("raw_prompt") or item.get("prompt")
-                if isinstance(raw_prompt, list):
-                    # Chat format: list of messages
-                    ids = self.tokenizer.apply_chat_template(raw_prompt, tokenize=True, add_generation_prompt=True)
-                else:
-                    ids = self.tokenizer.encode(raw_prompt)
-                all_ids.append(ids)
-
-            max_len = max(len(ids) for ids in all_ids)
-            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-            input_ids = torch.full((len(all_ids), max_len), pad_id, dtype=torch.long)
-            attention_mask = torch.zeros_like(input_ids)
-            for i, ids in enumerate(all_ids):
-                input_ids[i, -len(ids):] = torch.tensor(ids)  # left-pad
-                attention_mask[i, -len(ids):] = 1
-            position_ids = attention_mask.cumsum(dim=-1) - 1
-            position_ids.clamp_(min=0)
-
-            batch = DataProto.from_dict(tensors={
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            })
-            batch_padded, pad_size = pad_dataproto_to_divisor(batch, self.ref_policy_wg.world_size)
-            ref_embs_padded = self._compute_ref_embeddings(batch_padded)
-            ref_embs = unpad_dataproto(ref_embs_padded, pad_size=pad_size)
-            self._logo_meta_store.set_embeddings(chunk, ref_embs.batch["ref_embeddings"])
-
-        print(f"[LOGO] Embedding computation complete for {len(missing)} prompts.")
+        print(f"[LOGO] Encoding {n} prompts with {encoder_model} ...")
+        model = SentenceTransformer(encoder_model)
+        embeddings = model.encode(texts, batch_size=256, convert_to_tensor=True)
+        meta_store.set_embeddings(all_ids, embeddings.cpu())
+        del model
+        print(f"[LOGO] Precomputed embeddings for {n} prompts.")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1656,10 +1623,6 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            # LOGO: compute embeddings for Lake prompts before sampler iterates
-            if hasattr(self, "_logo_meta_store"):
-                self._compute_missing_logo_embeddings()
-
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)

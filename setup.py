@@ -58,6 +58,7 @@ SGLANG_REQUIRES = [
 ]
 TRL_REQUIRES = ["trl<=0.9.6"]
 MCORE_REQUIRES = ["mbridge"]
+LOGO_REQUIRES = ["sentence-transformers"]
 TRANSFERQUEUE_REQUIRES = ["TransferQueue==0.1.5"]
 
 extras_require = {
@@ -70,6 +71,7 @@ extras_require = {
     "sglang": SGLANG_REQUIRES,
     "trl": TRL_REQUIRES,
     "mcore": MCORE_REQUIRES,
+    "logo": LOGO_REQUIRES,
     "transferqueue": TRANSFERQUEUE_REQUIRES,
     "trtllm": TRTLLM_REQUIRES,
 }

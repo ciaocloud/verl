@@ -37,11 +37,12 @@ logo:
     gamma_clip_min: 0.1
     gamma_clip_max: 0.95
 
-  rag_miner:
+  miner:
     enable: false
+    candidate_batch_size: 4096
     similarity_threshold: 0.7
     k_neighbors: 5
-    sample_freq: 5
+    encoder_model: "all-MiniLM-L6-v2"
 
   preflight:
     enable: true

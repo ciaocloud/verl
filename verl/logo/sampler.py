@@ -12,16 +12,16 @@ from omegaconf import DictConfig
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.logo.config import DecayConfig, LOGOConfig, RAGMinerConfig, SamplingConfig
+from verl.logo.config import DecayConfig, LOGOConfig, MinerConfig, SamplingConfig
 from verl.logo.meta_store import PromptMetaStore
 
 
 class LOGOCurriculumSampler(AbstractCurriculumSampler):
     """Prompt sampler driven by Thompson-sampling priority scores.
 
-    Each epoch, scores are recomputed for every prompt via
-    ``meta_store.compute_sampling_scores``.  Prompts are then drawn either
-    by top-K deterministic selection or weighted multinomial.
+    Each epoch, the candidate miner scouts Lake prompts, builds a Frontier
+    (Memory + Candidates), and scores are computed over the Frontier.
+    Prompts are drawn by weighted multinomial from the Frontier.
 
     The ``update`` callback (called by the trainer after each step) feeds
     rollout rewards back into the meta-store.
@@ -42,8 +42,8 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         self.meta_store: Optional[PromptMetaStore] = None
         self.sampling_cfg: Optional[SamplingConfig] = None
         self.decay_cfg: Optional[DecayConfig] = None
-        self.rag_miner_cfg: Optional[RAGMinerConfig] = None
-        self.stochastic_miner = None  # Optional[StochasticMiner]
+        self.miner_cfg: Optional[MinerConfig] = None
+        self.candidate_miner = None  # Optional[CandidateMiner]
         self.current_step: int = 0
         self._epoch: int = 0
         self._scores: Optional[torch.Tensor] = None
@@ -61,7 +61,7 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         self,
         meta_store: PromptMetaStore,
         logo_config: LOGOConfig,
-        stochastic_miner=None,
+        candidate_miner=None,
     ):
         """Attach the meta-store, config, and optional miner after construction.
 
@@ -70,8 +70,8 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         self.meta_store = meta_store
         self.sampling_cfg = logo_config.sampling
         self.decay_cfg = logo_config.decay
-        self.rag_miner_cfg = logo_config.rag_miner
-        self.stochastic_miner = stochastic_miner
+        self.miner_cfg = logo_config.miner
+        self.candidate_miner = candidate_miner
 
         # Register all prompts with meta_store (defines Lake initially)
         all_ids = [str(i) for i in range(self.n_prompts)]
@@ -85,14 +85,19 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         return self.n_prompts
 
     def __iter__(self) -> Iterator[int]:
-        """Yield dataset indices for one epoch, ordered by sampling score.
+        """Yield n_prompts dataset indices drawn from the Frontier.
 
-        Sampler-level epsilon-greedy: each yielded index is replaced with a
-        uniformly random index with probability ``epsilon``.  This is the
-        primary mechanism for Lake exploration (prompts with no score info).
+        Pipeline:
+        1. candidate_miner.mine() scouts Lake candidates via kNN
+        2. candidate_miner.frontier() returns Memory + Candidates
+        3. Score the Frontier via meta_store.compute_sampling_scores
+        4. Sample n_prompts indices from Frontier (with replacement if
+           |Frontier| < n_prompts)
+        5. Epsilon-greedy: each selected index may be replaced with a
+           uniform random index from the full dataset
 
-        Sample counts are reset per-epoch and incremented lazily as the
-        DataLoader consumes indices (not eagerly when the epoch starts).
+        When no miner is configured, falls back to scoring all prompts
+        (original behavior).
         """
         if self.meta_store is None:
             # not configured yet -- fall back to sequential
@@ -100,40 +105,52 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             return
 
         self._epoch += 1
-        self._refresh_lake_cache()
-        self._recompute_scores()
 
-        if self.sampling_cfg is not None and self.sampling_cfg.top_k is not None:
-            k = min(self.sampling_cfg.top_k, self.n_prompts)
-            indices = torch.topk(self._scores, k=k).indices
-        else:
-            # weighted multinomial (without replacement)
+        if self.candidate_miner is not None:
+            # Stage 1: Mine candidates from Lake
+            self.candidate_miner.mine()
+            # Stage 2: Build Frontier = Memory + Candidates
+            frontier_ids = self.candidate_miner.frontier()
+
+            if not frontier_ids:
+                # No frontier (empty dataset) — fall back to sequential
+                yield from range(self.n_prompts)
+                return
+
+            # Score the Frontier
+            self._recompute_scores(prompt_ids=frontier_ids)
+
+            # Build index mapping: frontier position -> dataset index
+            frontier_dataset_indices = [int(pid) for pid in frontier_ids]
+
+            # Sample n_prompts from the Frontier
             weights = torch.softmax(self._scores, dim=0)
-            indices = torch.multinomial(weights, num_samples=self.n_prompts, replacement=False)
+            use_replacement = len(frontier_ids) < self.n_prompts
+            sampled_positions = torch.multinomial(
+                weights, num_samples=self.n_prompts, replacement=use_replacement
+            )
+            idx_list = [frontier_dataset_indices[pos] for pos in sampled_positions.tolist()]
+        else:
+            # No miner — score all prompts (original behavior)
+            self._recompute_scores()
 
-        idx_list = indices.tolist()
+            if self.sampling_cfg is not None and self.sampling_cfg.top_k is not None:
+                k = min(self.sampling_cfg.top_k, self.n_prompts)
+                indices = torch.topk(self._scores, k=k).indices
+            else:
+                weights = torch.softmax(self._scores, dim=0)
+                indices = torch.multinomial(weights, num_samples=self.n_prompts, replacement=False)
 
-        # Sampler-level epsilon-greedy: swap selected positions with
-        # random unused indices to guarantee no duplicates.
+            idx_list = indices.tolist()
+
+        # Sampler-level epsilon-greedy: replace some indices with uniform
+        # random from the full dataset
         eps = self.sampling_cfg.epsilon if self.sampling_cfg else 0.1
         if eps > 0:
-            available = list(set(range(self.n_prompts)) - set(idx_list))
-            np.random.shuffle(available)
-            avail_ptr = 0
             for i in range(len(idx_list)):
                 if np.random.rand() < eps:
-                    if avail_ptr < len(available):
-                        # Replace with an unused index; recycle the old one
-                        available.append(idx_list[i])
-                        idx_list[i] = available[avail_ptr]
-                        avail_ptr += 1
-                    else:
-                        # All indices in use (full sampling) — swap positions
-                        j = np.random.randint(0, len(idx_list))
-                        idx_list[i], idx_list[j] = idx_list[j], idx_list[i]
+                    idx_list[i] = np.random.randint(0, self.n_prompts)
 
-        # Cumulative counting happens in update() per step — no per-epoch reset
-        # so counts track training frequency across the entire run
         yield from idx_list
 
     # ------------------------------------------------------------------
@@ -214,37 +231,29 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             self.meta_store.update_logprobs(unique_ids, avg_lps)
 
         # Clean up miner cache: prompts that moved from Lake to Memory
-        if self.stochastic_miner is not None:
-            self.stochastic_miner.clear_moved_to_memory()
+        if self.candidate_miner is not None:
+            self.candidate_miner.clear_moved_to_memory()
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _refresh_lake_cache(self):
-        """Run the stochastic miner to extrapolate values for Lake prompts.
+    def _recompute_scores(self, prompt_ids=None):
+        """Recompute Thompson-sampling priority scores.
 
-        Called once per epoch before score computation.  Respects
-        ``rag_miner.sample_freq`` — only runs every N epochs.
+        Args:
+            prompt_ids: If provided, score only these prompts (Frontier).
+                        Otherwise score all prompts.
         """
-        if self.stochastic_miner is None:
-            return
-        rcfg = self.rag_miner_cfg
-        freq = rcfg.sample_freq if rcfg else 5
-        if self._epoch % freq != 0:
-            return
-        self.stochastic_miner.sample_and_extrapolate()
-
-    def _recompute_scores(self):
-        """Recompute Thompson-sampling priority scores for all prompts."""
-        all_ids = self.meta_store.all_prompt_ids()
-        if not all_ids:
+        if prompt_ids is None:
+            prompt_ids = self.meta_store.all_prompt_ids()
+        if not prompt_ids:
             self._scores = torch.ones(self.n_prompts)
             return
         scfg = self.sampling_cfg
-        lake_values = self.stochastic_miner.value_cache if self.stochastic_miner else None
+        lake_values = self.candidate_miner.value_cache if self.candidate_miner else None
         self._scores = self.meta_store.compute_sampling_scores(
-            prompt_ids=all_ids,
+            prompt_ids=prompt_ids,
             current_step=self.current_step,
             rho=scfg.rho if scfg else 1.0,
             staleness_bonus=scfg.staleness_bonus if scfg else 0.01,
@@ -295,7 +304,7 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         # Batch-level priority metrics (scores for prompts in the current step's batch)
         if self._last_batch_prompt_ids and self.meta_store is not None:
             scfg = self.sampling_cfg
-            lake_values = self.stochastic_miner.value_cache if self.stochastic_miner else None
+            lake_values = self.candidate_miner.value_cache if self.candidate_miner else None
             batch_scores = self.meta_store.compute_sampling_scores(
                 prompt_ids=self._last_batch_prompt_ids,
                 current_step=self.current_step,

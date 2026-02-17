@@ -183,14 +183,17 @@ algorithm:
       # Clip bounds for gamma to prevent extreme decay or memory
       gamma_clip_max: 0.95
 
-    # RAG-based stochastic miner configuration
-    rag_miner:
+    # Candidate miner configuration
+    miner:
 
       # Target dataclass for this configuration
-      _target_: verl.logo.config.RAGMinerConfig
+      _target_: verl.logo.config.MinerConfig
 
-      # Whether to enable RAG-based value extrapolation
+      # Whether to enable candidate mining
       enable: false
+
+      # Lake candidates to scout per mine()
+      candidate_batch_size: 4096
 
       # Similarity threshold for KNN
       similarity_threshold: 0.7
@@ -198,8 +201,8 @@ algorithm:
       # Number of neighbors for KNN
       k_neighbors: 5
 
-      # Sample from lake every N epochs
-      sample_freq: 5
+      # sentence-transformers model for embedding
+      encoder_model: "all-MiniLM-L6-v2"
 
     # Pre-flight initialization configuration
     preflight:

@@ -237,7 +237,6 @@ class PromptMetaStore:
 
             entry["n_obs"] += len(rs)
             entry["last_step"] = step
-            entry["last_logprob"] = 0.0  # updated externally if needed
 
         # Store step-level metrics for get_statistics() to report
         if gammas:
@@ -249,6 +248,17 @@ class PromptMetaStore:
             }
         else:
             self._last_update_metrics = {}
+
+    def update_logprobs(self, prompt_ids: List[str], logprobs: List[float]):
+        """Update last_logprob for prompts in the store.
+
+        Called after meta_store.update() with per-prompt mean logprobs
+        from the rollout, so the confidence gap in scoring is meaningful.
+        """
+        for pid, lp in zip(prompt_ids, logprobs):
+            entry = self._store.get(pid)
+            if entry is not None:
+                entry["last_logprob"] = float(lp)
 
     # ------------------------------------------------------------------
     # Sampling scores

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Sized
 from typing import Iterator, Optional
 
@@ -132,8 +132,8 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
                         j = np.random.randint(0, len(idx_list))
                         idx_list[i], idx_list[j] = idx_list[j], idx_list[i]
 
-        # Reset per-epoch; actual counting happens in update() per step
-        self._sample_counts = Counter()
+        # Cumulative counting happens in update() per step — no per-epoch reset
+        # so counts track training frequency across the entire run
         yield from idx_list
 
     # ------------------------------------------------------------------
@@ -193,6 +193,25 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             gamma_clip_min=dcfg.gamma_clip_min if dcfg else 0.1,
             gamma_clip_max=dcfg.gamma_clip_max if dcfg else 0.95,
         )
+
+        # --- update logprobs for confidence gap scoring ---
+        log_probs = None
+        if "old_log_probs" in batch.batch:
+            log_probs = batch.batch["old_log_probs"]
+        elif "rollout_log_probs" in batch.batch:
+            log_probs = batch.batch["rollout_log_probs"]
+
+        if log_probs is not None:
+            mask_sum = mask.sum(dim=-1).clamp(min=1)
+            mean_lp = (log_probs * mask).sum(dim=-1) / mask_sum
+            mean_lp_np = mean_lp.detach().cpu().float().numpy()
+            # Group by prompt_id and average (rollout.n > 1 repeats)
+            grouped_lp = defaultdict(list)
+            for pid, lp in zip(prompt_ids, mean_lp_np):
+                grouped_lp[pid].append(float(lp))
+            unique_ids = list(grouped_lp.keys())
+            avg_lps = [float(np.mean(grouped_lp[pid])) for pid in unique_ids]
+            self.meta_store.update_logprobs(unique_ids, avg_lps)
 
         # Clean up miner cache: prompts that moved from Lake to Memory
         if self.stochastic_miner is not None:

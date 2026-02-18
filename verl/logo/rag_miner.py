@@ -16,14 +16,16 @@ class RAGMiner:
 
     Stage 1 — ``mine()``: Draw ``candidate_batch_size`` prompts from Lake,
     extrapolate values via kNN cosine similarity against Memory embeddings.
-    The value cache is **replaced** (not merged) each call so stale guesses
-    from prior epochs don't linger.
+    New guesses are **merged** into the value cache so that prior-epoch
+    guesses for un-resampled candidates persist (stale-but-informative
+    beats no information).  ``clear_moved_to_memory()`` removes entries
+    that graduated to Memory.
 
-    Stage 2 — ``frontier()``: Return the union of Memory + Candidates
-    (deduplicated). This is the pool the sampler draws from.
+    Stage 2 — ``frontier()``: Return the union of Memory + all cached
+    candidates (deduplicated). This is the pool the sampler draws from.
 
-    Guessed values are stored in a transient cache and used ONLY for sampling
-    priority — never for advantage computation or gradient baselines.
+    Guessed values are used ONLY for sampling priority — never for
+    advantage computation or gradient baselines.
     """
 
     def __init__(
@@ -37,8 +39,8 @@ class RAGMiner:
         self.candidate_batch_size = candidate_batch_size
         self.similarity_threshold = similarity_threshold
         self.k_neighbors = k_neighbors
-        self.value_cache: Dict[str, float] = {}  # transient guessed values for candidates
-        self._candidate_ids: List[str] = []  # current candidate set from last mine()
+        self.value_cache: Dict[str, float] = {}  # accumulated guessed values for Lake candidates
+        self._candidate_ids: List[str] = []  # candidate set from last mine() call
 
     # ------------------------------------------------------------------
     # Stage 1: Mine candidates from Lake
@@ -47,16 +49,18 @@ class RAGMiner:
     def mine(self) -> Dict[str, float]:
         """Draw candidates from Lake and extrapolate values via kNN.
 
-        Replaces the value cache entirely each call (no stale accumulation).
+        New guesses are merged into ``value_cache``, overwriting entries
+        for re-sampled candidates while preserving prior-epoch guesses
+        for candidates that weren't re-sampled.  This gives the Frontier
+        progressively better coverage of Lake over epochs.
 
         Returns:
-            Dict mapping candidate prompt_id -> guessed value.
+            Dict mapping this batch's candidate prompt_id -> guessed value.
         """
         lake = self.meta_store.lake()
         memory_ids = self.meta_store.memory()
 
         if not lake:
-            self.value_cache = {}
             self._candidate_ids = []
             return {}
 
@@ -67,7 +71,7 @@ class RAGMiner:
         if not memory_ids:
             # No Memory to extrapolate from — uniform guess
             guesses = {pid: 0.5 for pid in candidate_ids}
-            self.value_cache = guesses
+            self.value_cache.update(guesses)
             return guesses
 
         # Get embeddings
@@ -76,7 +80,7 @@ class RAGMiner:
 
         if candidate_embs is None or memory_embs is None:
             guesses = {pid: 0.5 for pid in candidate_ids}
-            self.value_cache = guesses
+            self.value_cache.update(guesses)
             return guesses
 
         memory_values = self.meta_store.get_value(memory_ids)  # (n_memory,)
@@ -107,8 +111,8 @@ class RAGMiner:
                     valid_vals = memory_values_d[topk_idx[threshold_mask]]
                     guesses[pid] = (valid_sims * valid_vals).sum().item() / valid_sims.sum().item()
 
-        # Replace cache entirely (not merge)
-        self.value_cache = guesses
+        # Merge into cache (overwrites re-sampled, preserves old)
+        self.value_cache.update(guesses)
         return guesses
 
     # ------------------------------------------------------------------
@@ -116,14 +120,16 @@ class RAGMiner:
     # ------------------------------------------------------------------
 
     def frontier(self) -> List[str]:
-        """Return Memory + Candidates (deduplicated).
+        """Return Memory + all cached candidates (deduplicated).
 
-        This is the pool the sampler draws from.
+        Includes candidates from prior epochs that haven't been re-sampled,
+        giving progressively better Lake coverage over time.
         """
         memory_ids = self.meta_store.memory()
-        # Deduplicate: candidates that moved to Memory are already there
-        candidate_set = set(self._candidate_ids) - set(memory_ids)
-        return memory_ids + list(candidate_set)
+        memory_set = set(memory_ids)
+        # All cached candidates that haven't graduated to Memory
+        cached_lake = [pid for pid in self.value_cache if pid not in memory_set]
+        return memory_ids + cached_lake
 
     # ------------------------------------------------------------------
     # Topology management

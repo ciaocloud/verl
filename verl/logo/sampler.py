@@ -19,9 +19,12 @@ from verl.logo.meta_store import PromptMetaStore
 class LOGOCurriculumSampler(AbstractCurriculumSampler):
     """Prompt sampler driven by Thompson-sampling priority scores.
 
-    Each epoch, the candidate miner scouts Lake prompts, builds a Frontier
-    (Memory + Candidates), and scores are computed over the Frontier.
-    Prompts are drawn by weighted multinomial from the Frontier.
+    Active selection: each epoch yields exactly ``batch_size`` indices
+    sampled WITH replacement from priority-weighted scores.  High-priority
+    prompts can be revisited multiple times while low-priority ones are
+    skipped.  This means one epoch = one training step; control total
+    training steps via ``trainer.total_training_steps`` or a large
+    ``trainer.total_epochs``.
 
     The ``update`` callback (called by the trainer after each step) feeds
     rollout rewards back into the meta-store.
@@ -37,6 +40,7 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         self.data_source = data_source
         self.data_config = data_config
         self.n_prompts = len(data_source)
+        self.batch_size = int(data_config.get("gen_batch_size", data_config.train_batch_size))
 
         # populated via configure() before training starts
         self.meta_store: Optional[PromptMetaStore] = None
@@ -82,69 +86,56 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return self.n_prompts
+        return self.batch_size
 
     def __iter__(self) -> Iterator[int]:
-        """Yield n_prompts dataset indices drawn from the Frontier.
+        """Yield ``batch_size`` dataset indices via active selection.
 
         Pipeline:
-        1. candidate_miner.mine() scouts Lake candidates via kNN
-        2. candidate_miner.frontier() returns Memory + Candidates
-        3. Score the Frontier via meta_store.compute_sampling_scores
-        4. Sample n_prompts indices from Frontier (with replacement if
-           |Frontier| < n_prompts)
-        5. Epsilon-greedy: each selected index may be replaced with a
+        1. (Optional) candidate_miner.mine() scouts Lake candidates via kNN
+        2. Score prompts via meta_store.compute_sampling_scores
+        3. Sample ``batch_size`` indices WITH replacement from softmax(scores/T)
+        4. Epsilon-greedy: each selected index may be replaced with a
            uniform random index from the full dataset
-
-        When no miner is configured, falls back to scoring all prompts
-        (original behavior).
         """
         if self.meta_store is None:
-            # not configured yet -- fall back to sequential
-            yield from range(self.n_prompts)
+            yield from range(self.batch_size)
             return
 
         self._epoch += 1
+        n_samples = self.batch_size
+        temperature = self.sampling_cfg.temperature if self.sampling_cfg else 1.0
 
         if self.candidate_miner is not None:
-            # Stage 1: Mine candidates from Lake
             self.candidate_miner.mine()
-            # Stage 2: Build Frontier = Memory + Candidates
             frontier_ids = self.candidate_miner.frontier()
 
             if not frontier_ids:
-                # No frontier (empty dataset) — fall back to sequential
-                yield from range(self.n_prompts)
+                yield from np.random.randint(0, self.n_prompts, size=n_samples).tolist()
                 return
 
-            # Score the Frontier
             self._recompute_scores(prompt_ids=frontier_ids)
-
-            # Build index mapping: frontier position -> dataset index
             frontier_dataset_indices = [int(pid) for pid in frontier_ids]
 
-            # Sample n_prompts from the Frontier
-            weights = torch.softmax(self._scores, dim=0)
-            use_replacement = len(frontier_ids) < self.n_prompts
+            weights = torch.softmax(self._scores / temperature, dim=0)
             sampled_positions = torch.multinomial(
-                weights, num_samples=self.n_prompts, replacement=use_replacement
+                weights, num_samples=n_samples, replacement=True
             )
             idx_list = [frontier_dataset_indices[pos] for pos in sampled_positions.tolist()]
         else:
-            # No miner — score all prompts (original behavior)
             self._recompute_scores()
 
             if self.sampling_cfg is not None and self.sampling_cfg.top_k is not None:
                 k = min(self.sampling_cfg.top_k, self.n_prompts)
-                indices = torch.topk(self._scores, k=k).indices
+                top_indices = torch.topk(self._scores, k=k).indices
+                chosen = top_indices[torch.randint(0, k, (n_samples,))]
+                idx_list = chosen.tolist()
             else:
-                weights = torch.softmax(self._scores, dim=0)
-                indices = torch.multinomial(weights, num_samples=self.n_prompts, replacement=False)
+                weights = torch.softmax(self._scores / temperature, dim=0)
+                indices = torch.multinomial(weights, num_samples=n_samples, replacement=True)
+                idx_list = indices.tolist()
 
-            idx_list = indices.tolist()
-
-        # Sampler-level epsilon-greedy: replace some indices with uniform
-        # random from the full dataset
+        # Sampler-level epsilon-greedy
         eps = self.sampling_cfg.epsilon if self.sampling_cfg else 0.1
         if eps > 0:
             for i in range(len(idx_list)):
@@ -267,16 +258,11 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
     def get_statistics(self) -> dict:
         """Return priority score and sample count metrics.
 
-        Recomputes scores from current meta-store state so metrics reflect
-        step-by-step updates, not just the stale epoch-start snapshot.
+        Uses cached ``_scores`` from the last ``__iter__`` call to avoid
+        expensive recomputation and Thompson sampling noise every step.
         """
         stats = {}
 
-        # Recompute scores from current meta-store state
-        if self.meta_store is not None:
-            self._recompute_scores()
-
-        # Priority score metrics
         if self._scores is not None and len(self._scores) > 0:
             scores = self._scores
             stats.update({
@@ -286,15 +272,14 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
                 "logo/priority_min": scores.min().item(),
             })
 
-            # Entropy: how concentrated the sampling distribution is
-            weights = torch.softmax(scores, dim=0)
+            temperature = self.sampling_cfg.temperature if self.sampling_cfg else 1.0
+            weights = torch.softmax(scores / temperature, dim=0)
             log_weights = torch.log(weights + 1e-10)
             entropy = -(weights * log_weights).sum().item()
             max_entropy = float(np.log(len(scores)))
             stats["logo/priority_entropy"] = entropy
             stats["logo/priority_entropy_ratio"] = entropy / max(max_entropy, 1e-10)
 
-            # Top-bottom spread
             k = max(1, len(scores) // 10)
             top_k = torch.topk(scores, k=k).values.mean().item()
             bot_k = torch.topk(scores, k=k, largest=False).values.mean().item()

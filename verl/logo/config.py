@@ -13,6 +13,7 @@ class SamplingConfig(BaseConfig):
     top_k: Optional[int] = None  # None = weighted multinomial over all prompts
     staleness_bonus: float = 0.01  # bonus per step since last visit
     epsilon: float = 0.1  # sampler-level epsilon-greedy: probability of replacing a selected index with uniform random (enables Lake exploration)
+    temperature: float = 1.0  # softmax temperature for sampling weights (lower = more focused, higher = more uniform)
 
 
 @dataclass

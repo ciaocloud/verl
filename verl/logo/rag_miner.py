@@ -97,19 +97,22 @@ class RAGMiner:
             mem_norm = F.normalize(memory_embs_d, p=2, dim=-1)
             sims = cand_norm @ mem_norm.t()
 
-            guesses = {}
             k = min(self.k_neighbors, len(memory_ids))
+            topk_sims, topk_idx = sims.topk(k, dim=-1)  # (n_candidates, k)
+            topk_vals = memory_values_d[topk_idx]  # (n_candidates, k)
 
-            for i, pid in enumerate(candidate_ids):
-                topk_sims, topk_idx = sims[i].topk(k)
-                threshold_mask = topk_sims >= self.similarity_threshold
+            valid_mask = topk_sims >= self.similarity_threshold  # (n_candidates, k)
+            masked_sims = topk_sims * valid_mask.float()
+            sim_sums = masked_sims.sum(dim=-1)  # (n_candidates,)
+            weighted_vals = (masked_sims * topk_vals).sum(dim=-1)  # (n_candidates,)
 
-                if threshold_mask.sum() == 0:
-                    guesses[pid] = memory_values_d.mean().item()
-                else:
-                    valid_sims = topk_sims[threshold_mask]
-                    valid_vals = memory_values_d[topk_idx[threshold_mask]]
-                    guesses[pid] = (valid_sims * valid_vals).sum().item() / valid_sims.sum().item()
+            has_valid = sim_sums > 0
+            fallback = memory_values_d.mean()
+            guessed_values = torch.where(
+                has_valid, weighted_vals / sim_sums.clamp(min=1e-8), fallback
+            )
+
+            guesses = {pid: guessed_values[i].item() for i, pid in enumerate(candidate_ids)}
 
         # Merge into cache (overwrites re-sampled, preserves old)
         self.value_cache.update(guesses)

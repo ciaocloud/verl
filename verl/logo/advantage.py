@@ -88,12 +88,14 @@ def compute_logo_hybrid_advantage(
         # --- hybrid advantage ---
         hybrid = grpo_adv + lam * ppo_adv
 
-        # --- batch normalisation ---
+        # --- batch normalisation (center + scale) ---
+        batch_mean = hybrid.mean()
         batch_std = hybrid.std().clamp(min=epsilon)
-        normalised = hybrid / batch_std
+        normalised = (hybrid - batch_mean) / batch_std
 
         # broadcast to token level
         advantages = normalised.unsqueeze(-1) * response_mask
+        returns = scores.unsqueeze(-1) * response_mask
 
         # --- metrics ---
         metrics["logo/lambda_mean"] = lam.mean().item()
@@ -104,6 +106,7 @@ def compute_logo_hybrid_advantage(
         grpo_mag = grpo_adv.abs().mean().item()
         ppo_mag = ppo_adv.abs().mean().item()
         metrics["logo/global_local_ratio"] = ppo_mag / max(grpo_mag, epsilon)
+        metrics["logo/adv_batch_mean_pre_center"] = batch_mean.item()
 
         # sign conflict: GRPO says positive, stored value says negative
         if v_stored is not None:
@@ -112,4 +115,4 @@ def compute_logo_hybrid_advantage(
         else:
             metrics["logo/sign_conflict_rate"] = 0.0
 
-    return advantages, advantages, metrics
+    return advantages, returns, metrics

@@ -1241,6 +1241,18 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        # save LOGO meta-store
+        if hasattr(self, "_logo_meta_store"):
+            logo_state = {
+                "meta_store": self._logo_meta_store.state_dict(),
+                "sampler_step": getattr(self._logo_sampler, "current_step", 0),
+                "sampler_sample_counts": dict(getattr(self._logo_sampler, "_sample_counts", {})),
+            }
+            if getattr(self, "_logo_miner", None) is not None:
+                logo_state["miner_value_cache"] = dict(self._logo_miner.value_cache)
+            logo_path = os.path.join(local_global_step_folder, "logo_state.pt")
+            torch.save(logo_state, logo_path)
+
         # latest checkpointed iteration tracker (for atomic usage)
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -1313,6 +1325,22 @@ class RayPPOTrainer:
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+        # load LOGO meta-store
+        if hasattr(self, "_logo_meta_store"):
+            logo_path = os.path.join(global_step_folder, "logo_state.pt")
+            if os.path.exists(logo_path):
+                logo_state = torch.load(logo_path, weights_only=False)
+                self._logo_meta_store.load_state_dict(logo_state["meta_store"])
+                if hasattr(self, "_logo_sampler"):
+                    self._logo_sampler.current_step = logo_state.get("sampler_step", 0)
+                    from collections import Counter
+                    self._logo_sampler._sample_counts = Counter(logo_state.get("sampler_sample_counts", {}))
+                if getattr(self, "_logo_miner", None) is not None and "miner_value_cache" in logo_state:
+                    self._logo_miner.value_cache = logo_state["miner_value_cache"]
+                print(f"[LOGO] Restored meta-store with {len(self._logo_meta_store)} entries from {logo_path}")
+            else:
+                print(f"[LOGO] No meta-store checkpoint found at {logo_path}, starting fresh")
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""

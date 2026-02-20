@@ -16,6 +16,8 @@ logo:
     staleness_bonus: 0.01
     # Sampler-level epsilon-greedy: probability of replacing a selected index with uniform random
     epsilon: 0.1
+    # Softmax temperature for sampling weights (lower = more focused, higher = more uniform)
+    temperature: 1.0
 
   advantage:
     # Temperature for adaptive lambda: lower = more adaptive

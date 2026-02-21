@@ -11,10 +11,10 @@ import torch.nn.functional as F
 from verl.logo.meta_store import PromptMetaStore
 
 
-class RAGMiner:
+class ValuePropagator:
     """Two-stage candidate mining pipeline for Lake exploration.
 
-    Stage 1 — ``mine()``: Draw ``candidate_batch_size`` prompts from Lake,
+    Stage 1 — ``propagate()``: Draw ``candidate_batch_size`` prompts from Lake,
     extrapolate values via kNN cosine similarity against Memory embeddings.
     New guesses are **merged** into the value cache so that prior-epoch
     guesses for un-resampled candidates persist (stale-but-informative
@@ -46,7 +46,7 @@ class RAGMiner:
     # Stage 1: Mine candidates from Lake
     # ------------------------------------------------------------------
 
-    def mine(self) -> Dict[str, float]:
+    def propagate(self) -> Dict[str, float]:
         """Draw candidates from Lake and extrapolate values via kNN.
 
         New guesses are merged into ``value_cache``, overwriting entries

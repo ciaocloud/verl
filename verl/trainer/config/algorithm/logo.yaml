@@ -13,7 +13,7 @@ logo:
     # null = weighted multinomial over all prompts; int = deterministic top-K
     top_k: null
     # Bonus per step since last visit
-    staleness_bonus: 0.01
+    staleness_bonus: 0.0
     # Sampler-level epsilon-greedy: probability of replacing a selected index with uniform random
     epsilon: 0.1
     # Softmax temperature for sampling weights (lower = more focused, higher = more uniform)
@@ -39,7 +39,7 @@ logo:
     gamma_clip_min: 0.1
     gamma_clip_max: 0.95
 
-  miner:
+  propagator:
     enable: false
     candidate_batch_size: 4096
     similarity_threshold: 0.7

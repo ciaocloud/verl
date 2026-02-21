@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Sized
-from typing import Iterator, Optional
+from typing import Dict, Iterator, Optional
 
 import numpy as np
 import torch
@@ -12,9 +12,29 @@ from omegaconf import DictConfig
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.logo.config import DecayConfig, LOGOConfig, MinerConfig, SamplingConfig
+from verl.logo.config import LOGOConfig
 from verl.logo.meta_store import PromptMetaStore
+from verl.logo.rag_miner import ValuePropagator
 
+
+class IndexedDataset(torch.utils.data.Dataset):
+    """Thin wrapper that injects the dataset index as prompt_index for LOGO sampling."""
+
+    INDEX_KEY = "prompt_index"
+
+    def __init__(self, dataset: torch.utils.data.Dataset):
+        self._dataset = dataset
+
+    def __len__(self):
+        return len(self._dataset)
+
+    def __getitem__(self, idx):
+        item = self._dataset[idx]
+        item[self.INDEX_KEY] = idx
+        return item
+
+    def __getattr__(self, name):
+        return getattr(self._dataset, name)
 
 class LOGOCurriculumSampler(AbstractCurriculumSampler):
     """Prompt sampler driven by Thompson-sampling priority scores.
@@ -42,24 +62,25 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         self.n_prompts = len(data_source)
         self.batch_size = int(data_config.get("gen_batch_size", data_config.train_batch_size))
 
-        # populated via configure() before training starts
-        self.meta_store: Optional[PromptMetaStore] = None
-        self.sampling_cfg: Optional[SamplingConfig] = None
-        self.decay_cfg: Optional[DecayConfig] = None
-        self.miner_cfg: Optional[MinerConfig] = None
-        self.candidate_miner = None  # Optional[CandidateMiner]
+        self.store = PromptMetaStore(mode=data_config.logo.meta_store_mode)
+        self.propagator: Optional[ValuePropagator] = None
+        if data_config.logo.propagator.enable:
+            self.propagator = ValuePropagator(
+                meta_store=self.store,
+                candidate_batch_size=data_config.logo.propagator.candidate_batch_size,
+                similarity_threshold=data_config.logo.propagator.similarity_threshold,
+                k_neighbors=data_config.logo.propagator.k_neighbors,
+            )
+        
         self.current_step: int = 0
-        self._epoch: int = 0
+        # self._epoch: int = 0
         self._scores: Optional[torch.Tensor] = None
 
-        # Per-prompt cumulative sample counts (how many times each index was yielded)
+        # # Per-prompt cumulative sample counts (how many times each index was yielded)
         self._sample_counts: Counter = Counter()
-        # Prompt IDs from the last batch (for batch-level metrics)
+        self._unique_prompts_seen: set = set()
+        # # Prompt IDs from the last batch (for batch-level metrics)
         self._last_batch_prompt_ids: Optional[list] = None
-
-    # ------------------------------------------------------------------
-    # Setup (called by trainer before fit)
-    # ------------------------------------------------------------------
 
     def configure(
         self,
@@ -98,45 +119,35 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
         4. Epsilon-greedy: each selected index may be replaced with a
            uniform random index from the full dataset
         """
-        if self.meta_store is None:
-            yield from range(self.batch_size)
-            return
-
-        self._epoch += 1
         n_samples = self.batch_size
         temperature = self.sampling_cfg.temperature if self.sampling_cfg else 1.0
 
-        if self.candidate_miner is not None:
-            self.candidate_miner.mine()
-            frontier_ids = self.candidate_miner.frontier()
-
-            if not frontier_ids:
+        if self.propagator is not None:
+            self.propagator.propagate()
+        lake_vals = self.propagator.value_cache if self.propagator else None
+        self._scores = self.meta_store.compute_sampling_scores(
+            prompt_ids=self.meta_store.all_prompt_ids(),
+            current_step=self.current_step,
+            rho=self.sampling_cfg.rho if self.sampling_cfg else 1.0,
+            staleness_bonus=self.sampling_cfg.staleness_bonus if self.sampling_cfg else 0.01,
+            lake_value_estimates=lake_vals,
+        )
+        if self.propagator is not None:
+            frontier_ids = self.propagator.frontier()
+            if len(frontier_ids) == 0:
                 yield from np.random.randint(0, self.n_prompts, size=n_samples).tolist()
                 return
-
-            self._recompute_scores(prompt_ids=frontier_ids)
-            frontier_dataset_indices = [int(pid) for pid in frontier_ids]
-
-            weights = torch.softmax(self._scores / temperature, dim=0)
-            sampled_positions = torch.multinomial(
-                weights, num_samples=n_samples, replacement=True
-            )
-            idx_list = [frontier_dataset_indices[pos] for pos in sampled_positions.tolist()]
+            frontier_scores = self._scores[frontier_ids]
+            weights = torch.softmax(frontier_scores / temperature, dim=0)
+            sampled_positions = torch.multinomial(weights, num_samples=n_samples, replacement=True)
+            idx_list = [frontier_ids[pos] for pos in sampled_positions.tolist()]
         else:
-            self._recompute_scores()
-
-            if self.sampling_cfg is not None and self.sampling_cfg.top_k is not None:
-                k = min(self.sampling_cfg.top_k, self.n_prompts)
-                top_indices = torch.topk(self._scores, k=k).indices
-                chosen = top_indices[torch.randint(0, k, (n_samples,))]
-                idx_list = chosen.tolist()
-            else:
-                weights = torch.softmax(self._scores / temperature, dim=0)
-                indices = torch.multinomial(weights, num_samples=n_samples, replacement=True)
-                idx_list = indices.tolist()
+            weights = torch.softmax(self._scores / temperature, dim=0)
+            indices = torch.multinomial(weights, num_samples=n_samples, replacement=True)
+            idx_list = indices.tolist()
 
         # Sampler-level epsilon-greedy
-        eps = self.sampling_cfg.epsilon if self.sampling_cfg else 0.1
+        eps = self.sampling_cfg.epsilon if self.sampling_cfg else 0.0
         if eps > 0:
             for i in range(len(idx_list)):
                 if np.random.rand() < eps:
@@ -164,8 +175,13 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
 
         # Track unique prompts actually trained on this step
         # (deduplicate because rollout.n > 1 repeats prompt_ids)
-        if "logo_prompt_id" in batch.non_tensor_batch:
-            self._sample_counts.update(set(batch.non_tensor_batch["logo_prompt_id"].tolist()))
+        prompt_ids = self._extract_prompt_ids(batch)
+        if prompt_ids is None:
+            return
+        
+        # if "logo_prompt_id" in batch.non_tensor_batch:
+        self._sample_counts.update(set(prompt_ids))
+        self._unique_prompts_seen.update(set(prompt_ids))
 
         # --- extract sequence-level reward ---
         if "token_level_rewards" in batch.batch.keys():
@@ -177,14 +193,6 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
 
         mask = batch.batch["response_mask"]
         seq_rewards = (token_rewards * mask).sum(dim=-1)  # (bs,)
-
-        # --- prompt ids ---
-        if "logo_prompt_id" in batch.non_tensor_batch:
-            prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
-        elif "uid" in batch.non_tensor_batch:
-            prompt_ids = batch.non_tensor_batch["uid"].tolist()
-        else:
-            return
 
         # Save unique prompt IDs for batch-level metrics in get_statistics()
         self._last_batch_prompt_ids = list(dict.fromkeys(prompt_ids))
@@ -208,7 +216,6 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             log_probs = batch.batch["old_log_probs"]
         elif "rollout_log_probs" in batch.batch:
             log_probs = batch.batch["rollout_log_probs"]
-
         if log_probs is not None:
             mask_sum = mask.sum(dim=-1).clamp(min=1)
             mean_lp = (log_probs * mask).sum(dim=-1) / mask_sum
@@ -222,38 +229,60 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
             self.meta_store.update_logprobs(unique_ids, avg_lps)
 
         # Clean up miner cache: prompts that moved from Lake to Memory
-        if self.candidate_miner is not None:
-            self.candidate_miner.clear_moved_to_memory()
+        if self.propagator is not None:
+            self.propagator.clear_moved_to_memory()
 
     # ------------------------------------------------------------------
-    # Internal
+    # Batch preparation (called by trainer before advantage computation)
     # ------------------------------------------------------------------
 
-    def _recompute_scores(self, prompt_ids=None):
-        """Recompute Thompson-sampling priority scores.
+    # def prepare_batch(self, batch: DataProto):
+    #     """Inject ``v_stored`` into the batch for the LOGO advantage estimator."""
+    #     prompt_ids = self._extract_prompt_ids(batch)
+    #     if prompt_ids is not None:
+    #         batch.batch["v_stored"] = self.meta_store.get_values(prompt_ids)
 
-        Args:
-            prompt_ids: If provided, score only these prompts (Frontier).
-                        Otherwise score all prompts.
-        """
-        if prompt_ids is None:
-            prompt_ids = self.meta_store.all_prompt_ids()
-        if not prompt_ids:
-            self._scores = torch.ones(self.n_prompts)
-            return
-        scfg = self.sampling_cfg
-        lake_values = self.candidate_miner.value_cache if self.candidate_miner else None
-        self._scores = self.meta_store.compute_sampling_scores(
-            prompt_ids=prompt_ids,
-            current_step=self.current_step,
-            rho=scfg.rho if scfg else 1.0,
-            staleness_bonus=scfg.staleness_bonus if scfg else 0.01,
-            lake_value_estimates=lake_values,
-        )
+    @staticmethod
+    def _extract_prompt_ids(batch: DataProto) -> Optional[list]:
+        if IndexedDataset.INDEX_KEY in batch.non_tensor_batch:
+            return batch.non_tensor_batch[IndexedDataset.INDEX_KEY].tolist()
+        elif "uid" in batch.non_tensor_batch:
+            return batch.non_tensor_batch["uid"].tolist()
+        else:
+            return None
 
     # ------------------------------------------------------------------
-    # Statistics (for logging)
+    # Metrics (for logging)
     # ------------------------------------------------------------------
+    def collect_metrics(self, batch: DataProto, step: int) -> Dict[str, float]:
+        """Gather all LOGO metrics for logging."""
+        metrics: Dict[str, float] = {}
+
+        # Advantage metrics (populated by compute_logo_advantage via meta_info)
+        for k, v in batch.meta_info.items():
+            if k.startswith("logo/"):
+                metrics[k] = v
+        # Value vs reward correlation
+        if "v_stored" in batch.batch and "token_level_scores" in batch.batch:
+            v_s = batch.batch["v_stored"].float()
+            r_s = batch.batch["token_level_scores"].sum(dim=-1).float()
+            if v_s.std() > 1e-8 and r_s.std() > 1e-8:
+                metrics["logo/value_reward_corr"] = torch.corrcoef(torch.stack([v_s, r_s]))[0, 1].item()
+            metrics["logo/value_prediction_error"] = (v_s - r_s).pow(2).mean().item()
+            metrics["logo/batch_reward_mean"] = r_s.mean().item()
+
+        metrics["logo/unique_prompts_seen"] = float(len(self._unique_prompts_seen))
+
+        # Meta-store statistics
+        metrics.update(self.meta_store.get_statistics(current_step=step))
+
+        # Priority score statistics
+        metrics.update(self.get_statistics())
+
+        # Propagator statistics
+        if self.propagator is not None:
+            metrics.update(self.propagator.get_statistics())
+        return metrics
 
     def get_statistics(self) -> dict:
         """Return priority score and sample count metrics.
@@ -272,19 +301,19 @@ class LOGOCurriculumSampler(AbstractCurriculumSampler):
                 "logo/priority_min": scores.min().item(),
             })
 
-            temperature = self.sampling_cfg.temperature if self.sampling_cfg else 1.0
-            weights = torch.softmax(scores / temperature, dim=0)
-            log_weights = torch.log(weights + 1e-10)
-            entropy = -(weights * log_weights).sum().item()
-            max_entropy = float(np.log(len(scores)))
-            stats["logo/priority_entropy"] = entropy
-            stats["logo/priority_entropy_ratio"] = entropy / max(max_entropy, 1e-10)
+            # temperature = self.sampling_cfg.temperature if self.sampling_cfg else 1.0
+            # weights = torch.softmax(scores / temperature, dim=0)
+            # log_weights = torch.log(weights + 1e-10)
+            # entropy = -(weights * log_weights).sum().item()
+            # max_entropy = float(np.log(len(scores)))
+            # stats["logo/priority_entropy"] = entropy
+            # stats["logo/priority_entropy_ratio"] = entropy / max(max_entropy, 1e-10)
 
-            k = max(1, len(scores) // 10)
-            top_k = torch.topk(scores, k=k).values.mean().item()
-            bot_k = torch.topk(scores, k=k, largest=False).values.mean().item()
-            stats["logo/priority_top10pct"] = top_k
-            stats["logo/priority_bot10pct"] = bot_k
+            # k = max(1, len(scores) // 10)
+            # top_k = torch.topk(scores, k=k).values.mean().item()
+            # bot_k = torch.topk(scores, k=k, largest=False).values.mean().item()
+            # stats["logo/priority_top10pct"] = top_k
+            # stats["logo/priority_bot10pct"] = bot_k
 
         # Batch-level priority metrics (scores for prompts in the current step's batch)
         if self._last_batch_prompt_ids and self.meta_store is not None:

@@ -36,21 +36,18 @@ class PromptMetaStore:
         if mode not in ("bayesian", "ema"):
             raise ValueError(f"mode must be 'bayesian' or 'ema', got {mode}")
         self.mode = mode
-        self.alpha_init = self.ALPHA_INIT
-        self.beta_init = self.BETA_INIT
-        self.value_init = self.VALUE_INIT
-        self._store: Dict[str, dict] = {}
-        self._all_prompt_ids: List[str] = []
-        self._embeddings: Dict[str, torch.Tensor] = {}  # prompt_id -> embedding (works for Memory AND Lake)
+        self._store: dict = {}
+        self._all_prompt_ids: list = []
+        self._embeddings: dict = {}  # prompt_id -> embedding (works for Memory AND Lake)
 
         # Step-level accumulators (reset each update() call, read by get_statistics)
-        self._last_update_metrics: Dict[str, float] = {}
+        self._last_update_metrics: dict = {}
 
     # ------------------------------------------------------------------
     # Dataset Registration & Memory/Lake Topology
     # ------------------------------------------------------------------
 
-    def register_dataset(self, prompt_ids: List[str]):
+    def register_dataset(self, prompt_ids: list):
         """Register all prompt IDs from the dataset.
 
         This defines the full universe of prompts (Memory + Lake).
@@ -58,11 +55,11 @@ class PromptMetaStore:
         """
         self._all_prompt_ids = list(prompt_ids)
 
-    def memory(self) -> List[str]:
+    def memory(self) -> list:
         """Return Memory: prompt IDs with rollout data."""
         return list(self._store.keys())
 
-    def lake(self) -> List[str]:
+    def lake(self) -> list:
         """Return Lake: registered prompt IDs not yet in _store."""
         store_set = set(self._store.keys())
         return [pid for pid in self._all_prompt_ids if pid not in store_set]
@@ -77,13 +74,13 @@ class PromptMetaStore:
         return {
             "alpha": 0.0,
             "beta": 0.0,
-            "value": self.value_init,  # placeholder v_old for first update
+            "value": 0.0,  # placeholder v_old for first update
             "n_obs": 0,
             "last_step": 0,
             "last_logprob": 0.0,
         }
 
-    def _lazy_initialize(self, prompt_id: str):
+    def _lazy_initialize(self, prompt_id):
         """Lazily add a prompt to the store upon first visit."""
         if prompt_id not in self._store:
             self._store[prompt_id] = self._fresh_entry()
@@ -91,14 +88,14 @@ class PromptMetaStore:
     def __len__(self):
         return len(self._store)
 
-    def __contains__(self, prompt_id: str) -> bool:
+    def __contains__(self, prompt_id) -> bool:
         return prompt_id in self._store
 
     # ------------------------------------------------------------------
     # Value queries
     # ------------------------------------------------------------------
 
-    def get_value(self, prompt_ids: List[str]) -> torch.Tensor:
+    def get_value(self, prompt_ids: list) -> torch.Tensor:
         """Return value estimate for each prompt.
 
         Memory prompts: return stored value.
@@ -113,7 +110,7 @@ class PromptMetaStore:
                 values.append(entry["value"])
         return torch.tensor(values, dtype=torch.float32)
 
-    def get_alpha_beta(self, prompt_ids: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_alpha_beta(self, prompt_ids: list) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return alpha/beta parameters (only meaningful in bayesian mode).
 
         Lake prompts return (0, 0) — no prior information.
@@ -134,7 +131,7 @@ class PromptMetaStore:
                     betas.append(1.0 - v)
         return torch.tensor(alphas, dtype=torch.float32), torch.tensor(betas, dtype=torch.float32)
 
-    def get_variance(self, prompt_ids: List[str]) -> torch.Tensor:
+    def get_variance(self, prompt_ids: list) -> torch.Tensor:
         """Return variance/uncertainty estimate for each prompt.
 
         Bayesian: Beta distribution variance = ab / ((a+b)^2 (a+b+1))
@@ -163,7 +160,7 @@ class PromptMetaStore:
 
     def update(
         self,
-        prompt_ids: List[str],
+        prompt_ids: list,
         rewards: torch.Tensor,
         step: int,
         decay_mode: str = "adaptive",
@@ -185,7 +182,7 @@ class PromptMetaStore:
         """
         rewards_np = rewards.detach().cpu().float().numpy()
 
-        grouped: Dict[str, List[float]] = defaultdict(list)
+        grouped = defaultdict(list)
         for pid, r in zip(prompt_ids, rewards_np):
             grouped[pid].append(float(r))
 
@@ -249,7 +246,7 @@ class PromptMetaStore:
         else:
             self._last_update_metrics = {}
 
-    def update_logprobs(self, prompt_ids: List[str], logprobs: List[float]):
+    def update_logprobs(self, prompt_ids: list, logprobs: List[float]):
         """Update last_logprob for prompts in the store.
 
         Called after meta_store.update() with per-prompt mean logprobs
@@ -266,11 +263,11 @@ class PromptMetaStore:
 
     def compute_sampling_scores(
         self,
-        prompt_ids: List[str],
+        prompt_ids: list,
         current_step: int,
         rho: float = 1.0,
         staleness_bonus: float = 0.01,
-        lake_value_estimates: Optional[Dict[str, float]] = None,
+        lake_value_estimates: Optional[Dict[int, float]] = None,
     ) -> torch.Tensor:
         """Priority score for prompt sampling.
 
@@ -325,7 +322,7 @@ class PromptMetaStore:
     # Embeddings (for RAG miner)
     # ------------------------------------------------------------------
 
-    def set_embeddings(self, prompt_ids: List[str], embeddings: torch.Tensor):
+    def set_embeddings(self, prompt_ids: list, embeddings: torch.Tensor):
         """Store prompt embeddings (detached, on CPU).
 
         Works for any registered prompt (Memory or Lake).
@@ -334,7 +331,7 @@ class PromptMetaStore:
         for i, pid in enumerate(prompt_ids):
             self._embeddings[pid] = embeddings_cpu[i]
 
-    def get_embeddings(self, prompt_ids: List[str]) -> Optional[torch.Tensor]:
+    def get_embeddings(self, prompt_ids: list) -> Optional[torch.Tensor]:
         """Retrieve embeddings; returns None if any are missing."""
         embs = []
         for pid in prompt_ids:
@@ -344,7 +341,7 @@ class PromptMetaStore:
             embs.append(emb)
         return torch.stack(embs)
 
-    def prompts_without_embeddings(self) -> List[str]:
+    def prompts_without_embeddings(self) -> list:
         """Return registered prompt IDs that don't have embeddings yet."""
         return [pid for pid in self._all_prompt_ids if pid not in self._embeddings]
 
@@ -352,11 +349,11 @@ class PromptMetaStore:
     # Legacy aliases
     # ------------------------------------------------------------------
 
-    def visited_prompt_ids(self) -> List[str]:
+    def visited_prompt_ids(self) -> list:
         """Alias for memory(). Deprecated: use memory() instead."""
         return self.memory()
 
-    def all_prompt_ids(self) -> List[str]:
+    def all_prompt_ids(self) -> list:
         """Return all registered prompt IDs (Memory + Lake)."""
         return self._all_prompt_ids
 

@@ -10,7 +10,7 @@ from verl.utils import as_torch_index, group_mean_std
 
 
 @register_adv_est("logo")
-def compute_logo_hybrid_advantage(
+def compute_logo_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index=None,

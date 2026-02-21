@@ -200,9 +200,6 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
-        # Add v_stored for LOGO hybrid advantage
-        if "v_stored" in data.batch:
-            adv_kwargs["v_stored"] = data.batch["v_stored"]
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -214,6 +211,9 @@ def compute_advantage(
             # Get pre-computed rollout IS weights if available
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
+        # LOGO: Add v_stored for LOGO hybrid advantage
+        if "v_stored" in data.batch:
+            adv_kwargs["v_stored"] = data.batch["v_stored"]
 
         # calculate advantage estimator
         result = adv_estimator_fn(**adv_kwargs)
@@ -345,10 +345,10 @@ class RayPPOTrainer:
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         # LOGO: wrap dataset to inject persistent prompt IDs and create curriculum sampler
+        self._logo_sampler = None
         if self.config.algorithm.get("adv_estimator", "") == "logo":
-            self._init_logo(train_dataset)
-            train_dataset = self._logo_dataset  # use wrapped dataset
-            self.train_dataset = train_dataset   # update instance attr so DataLoader uses it
+            self._logo_sampler = self._init_logo(train_dataset)
+            train_dataset = self.train_dataset   # update instance attr so DataLoader uses it
             train_sampler = self._logo_sampler   # use curriculum sampler
 
         if train_sampler is None:
@@ -417,69 +417,32 @@ class RayPPOTrainer:
         import verl.logo.advantage  # registers "logo" advantage estimator
         from verl.logo.config import LOGOConfig
         from verl.logo.meta_store import PromptMetaStore
-        from verl.logo.rag_miner import RAGMiner
-        from verl.logo.sampler import LOGOCurriculumSampler
+        from verl.logo.sampler import IndexedDataset, LOGOCurriculumSampler
         from omegaconf import OmegaConf
 
         # Get LOGO config from algorithm config
         logo_cfg_dict = self.config.algorithm.get("logo", {})
-
         # Create structured config by merging with defaults
         logo_cfg = OmegaConf.merge(
             OmegaConf.structured(LOGOConfig),
             logo_cfg_dict
         )
 
-        # 1. Meta-store
-        self._logo_meta_store = PromptMetaStore(mode=logo_cfg.value_mode)
-        # Note: prompt_ids are registered via sampler.configure() below (lazy init)
-
-        # 2. Thin dataset wrapper that injects persistent prompt IDs
-        class _IndexedDataset:
-            def __init__(self, ds):
-                self._ds = ds
-
-            def __len__(self):
-                return len(self._ds)
-
-            def __getitem__(self, idx):
-                item = self._ds[idx]
-                item["logo_prompt_id"] = str(idx)
-                return item
-
-            def __getattr__(self, name):
-                # Delegate unknown attributes to the underlying dataset
-                return getattr(self._ds, name)
-
-        self._logo_dataset = _IndexedDataset(train_dataset)
-
-        # 3. Candidate miner (kNN value extrapolation for Lake prompts)
-        miner = None
-        if logo_cfg.miner.enable:
-            # Precompute embeddings using lightweight sentence-transformer
-            self._precompute_logo_embeddings(
-                dataset=self._logo_dataset,
-                meta_store=self._logo_meta_store,
-                encoder_model=logo_cfg.miner.encoder_model,
-            )
-            miner = RAGMiner(
-                meta_store=self._logo_meta_store,
-                candidate_batch_size=logo_cfg.miner.candidate_batch_size,
-                similarity_threshold=logo_cfg.miner.similarity_threshold,
-                k_neighbors=logo_cfg.miner.k_neighbors,
-            )
-        self._logo_miner = miner
-
-        # 4. Curriculum sampler
-        self._logo_sampler = LOGOCurriculumSampler(
+        self.train_dataset = IndexedDataset(train_dataset)
+        sampler = LOGOCurriculumSampler(
             data_source=self._logo_dataset,
             data_config=self.config.data,
-        )
-        self._logo_sampler.configure(
-            meta_store=self._logo_meta_store,
             logo_config=logo_cfg,
-            candidate_miner=miner,
         )
+        if logo_cfg.propagator.enable:
+            self._precompute_logo_embeddings(
+                dataset=self._logo_dataset,
+                meta_store=sampler.meta_store,
+                encoder_model=logo_cfg.propagator.encoder_model,
+            )
+
+        return sampler
+
 
     def _logo_preflight(self):
         """Run pre-flight epoch: rollout 1 sample per prompt to seed meta-store.
@@ -520,6 +483,7 @@ class RayPPOTrainer:
         )
 
         total_updated = 0
+        prompt_index_key = self._logo_sampler.INDEX_KEY
         for batch_dict in self.train_dataloader:
             batch = DataProto.from_single_dict(batch_dict)
 
@@ -556,8 +520,8 @@ class RayPPOTrainer:
             batch.batch["response_mask"] = response_mask
             seq_rewards = (reward_tensor * response_mask).sum(dim=-1)
 
-            if "logo_prompt_id" in batch.non_tensor_batch:
-                prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
+            if prompt_index_key in batch.non_tensor_batch:
+                prompt_ids = batch.non_tensor_batch[prompt_index_key].tolist()
 
                 # --- logprob-based fix: blend reward with model confidence ---
                 log_probs = None
@@ -583,15 +547,14 @@ class RayPPOTrainer:
                     step=0,
                     decay_mode="fixed",
                     gamma=1.0,
+                    gamma_clip_min=0.0,
                     gamma_clip_max=1.0,
                 )
 
                 # Store mean logprob for confidence gap in sampling scores
                 if mean_lp is not None:
                     lp_np = mean_lp.detach().cpu().float().numpy()
-                    for pid, lp in zip(prompt_ids, lp_np):
-                        if pid in self._logo_meta_store._store:
-                            self._logo_meta_store._store[pid]["last_logprob"] = float(lp)
+                    self._logo_meta_store.update_logprobs(prompt_ids=prompt_ids, logprobs=lp_np.tolist())
 
                 total_updated += len(prompt_ids)
 
@@ -620,7 +583,7 @@ class RayPPOTrainer:
             return
 
         n = len(dataset)
-        all_ids = [str(i) for i in range(n)]
+        all_ids = list(range(n)) 
 
         # Extract text from all prompts
         texts = []
@@ -1880,9 +1843,10 @@ class RayPPOTrainer:
                         )  # GRPO adv normalization factor
 
                         # LOGO: populate v_stored from meta-store before advantage computation
-                        if hasattr(self, "_logo_meta_store") and "logo_prompt_id" in batch.non_tensor_batch:
-                            prompt_ids = batch.non_tensor_batch["logo_prompt_id"].tolist()
-                            batch.batch["v_stored"] = self._logo_meta_store.get_value(prompt_ids)
+                        if self._logo_sampler is not None:
+                            prompt_ids = self._logo_sampler._extract_prompt_ids(batch)
+                            if prompt_ids is not None:
+                                batch.batch["v_stored"] = self._logo_sampler.meta_store.get_value(prompt_ids)
 
                         batch = compute_advantage(
                             batch,
@@ -1995,39 +1959,9 @@ class RayPPOTrainer:
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # LOGO: collect all LOGO metrics
-                if hasattr(self, "_logo_meta_store"):
-                    # advantage metrics (populated by compute_logo_hybrid_advantage)
-                    logo_adv_keys = [
-                        k for k in batch.meta_info if k.startswith("logo/")
-                    ]
-                    for k in logo_adv_keys:
-                        metrics[k] = batch.meta_info[k]
-
-                    # stored value vs actual reward
-                    if "v_stored" in batch.batch and "token_level_scores" in batch.batch:
-                        v_s = batch.batch["v_stored"].float()
-                        r_s = batch.batch["token_level_scores"].sum(dim=-1).float()
-                        if v_s.std() > 1e-8 and r_s.std() > 1e-8:
-                            corr = torch.corrcoef(torch.stack([v_s, r_s]))[0, 1].item()
-                            metrics["logo/value_reward_corr"] = corr
-                        metrics["logo/value_prediction_error"] = (v_s - r_s).pow(2).mean().item()
-                        metrics["logo/batch_reward_mean"] = r_s.mean().item()
-
-                    # cumulative unique prompts explored
-                    if not hasattr(self, "_logo_unique_prompts_seen"):
-                        self._logo_unique_prompts_seen = set()
-                    if "logo_prompt_id" in batch.non_tensor_batch:
-                        self._logo_unique_prompts_seen.update(
-                            batch.non_tensor_batch["logo_prompt_id"].tolist()
-                        )
-                    metrics["logo/unique_prompts_seen"] = float(len(self._logo_unique_prompts_seen))
-
-                    # meta-store, miner, and sampler statistics
-                    metrics.update(self._logo_meta_store.get_statistics(current_step=self.global_steps))
-                    if getattr(self, "_logo_miner", None) is not None:
-                        metrics.update(self._logo_miner.get_statistics())
-                    if hasattr(self, "_logo_sampler") and hasattr(self._logo_sampler, "get_statistics"):
-                        metrics.update(self._logo_sampler.get_statistics())
+                if self._logo_sampler is not None:
+                    logo_metrics = self._logo_sampler.collect_metrics(batch)
+                    metrics.update(logo_metrics)
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

@@ -10,8 +10,7 @@ from verl.base_config import BaseConfig
 class SamplingConfig(BaseConfig):
     """Config for variance-based prompt sampling."""
     rho: float = 1.0  # confidence calibration weight in priority score
-    top_k: Optional[int] = None  # None = weighted multinomial over all prompts
-    staleness_bonus: float = 0.01  # bonus per step since last visit
+    staleness_bonus: float = 0.0  # bonus per step since last visit
     epsilon: float = 0.1  # sampler-level epsilon-greedy: probability of replacing a selected index with uniform random (enables Lake exploration)
     temperature: float = 1.0  # softmax temperature for sampling weights (lower = more focused, higher = more uniform)
 
@@ -35,7 +34,7 @@ class DecayConfig(BaseConfig):
 
 
 @dataclass
-class MinerConfig(BaseConfig):
+class PropagatorConfig(BaseConfig):
     """Config for candidate mining."""
     enable: bool = False
     candidate_batch_size: int = 4096  # Lake candidates to scout per mine()
@@ -45,7 +44,7 @@ class MinerConfig(BaseConfig):
 
 
 @dataclass
-class PreFlightConfig(BaseConfig):
+class PreflightConfig(BaseConfig):
     """Config for pre-flight initialization epoch."""
     enable: bool = True
     sample_fraction: float = 1.0  # fraction of prompts to scout
@@ -61,5 +60,5 @@ class LOGOConfig(BaseConfig):
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     advantage: AdvantageConfig = field(default_factory=AdvantageConfig)
     decay: DecayConfig = field(default_factory=DecayConfig)
-    miner: MinerConfig = field(default_factory=MinerConfig)
-    preflight: PreFlightConfig = field(default_factory=PreFlightConfig)
+    propagator: PropagatorConfig = field(default_factory=PropagatorConfig)
+    preflight: PreflightConfig = field(default_factory=PreflightConfig)

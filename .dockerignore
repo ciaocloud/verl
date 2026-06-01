@@ -1,0 +1,37 @@
+.git
+.DS_Store
+
+# Local configuration and credentials.
+.env
+**/.env
+*.pem
+*.key
+credentials.json
+
+# Python/build caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Local virtualenvs and generated data.
+.venv/
+.venv-*/
+venv/
+ENV/
+tmp/
+outputs/
+logs/
+log/
+wandb/
+
+# Large local training artifacts.
+**/checkpoints/
+*.parquet
+*.pt
+*.ckpt
+*.tar.gz

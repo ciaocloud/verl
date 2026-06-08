@@ -18,6 +18,9 @@ CRITIC_MODEL_PATH="${CRITIC_MODEL_PATH:-${MODEL_PATH}}"
 DATA_DIR="${DATA_DIR:-/workspace/data}"
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/outputs/${EXP_NAME}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${OUTPUT_DIR}/checkpoints}"
+METRICS_DIR="${METRICS_DIR:-${OUTPUT_DIR}/metrics}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-${METRICS_DIR}/tensorboard}"
+VERL_FILE_LOGGER_PATH="${VERL_FILE_LOGGER_PATH:-${METRICS_DIR}/metrics.jsonl}"
 RL_ALGORITHM="${RL_ALGORITHM:-grpo}"
 ADV_ESTIMATOR_OVERRIDE="${ADV_ESTIMATOR:-}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-}"
@@ -39,7 +42,8 @@ EOF
   exit 1
 fi
 
-mkdir -p "${DATA_DIR}" "${OUTPUT_DIR}" "${CHECKPOINT_DIR}" "${DATA_DIR}/input"
+mkdir -p "${DATA_DIR}" "${OUTPUT_DIR}" "${CHECKPOINT_DIR}" "${METRICS_DIR}" "${TENSORBOARD_DIR}" "${DATA_DIR}/input"
+export TENSORBOARD_DIR VERL_FILE_LOGGER_PATH
 
 download_gcs_file() {
   local uri="$1"
@@ -149,9 +153,89 @@ for path in src.rglob("*"):
 PY
 }
 
+upload_dir_contents_to_gcs() {
+  local src="$1"
+  local dst_uri="$2"
+
+  [[ -d "${src}" ]] || return 0
+
+  if command -v gcloud >/dev/null 2>&1; then
+    gcloud storage rsync --recursive "${src}" "${dst_uri%/}"
+    return
+  fi
+
+  python3 - "${src}" "${dst_uri}" <<'PY'
+import sys
+from pathlib import Path
+from google.cloud import storage
+
+src = Path(sys.argv[1])
+uri = sys.argv[2]
+if not uri.startswith("gs://"):
+    raise SystemExit(f"expected gs:// URI, got {uri}")
+
+bucket_name, _, prefix = uri[5:].partition("/")
+client = storage.Client()
+bucket = client.bucket(bucket_name)
+
+for path in src.rglob("*"):
+    if path.is_file():
+        rel = path.relative_to(src)
+        blob_name = "/".join(part for part in [prefix.rstrip("/"), str(rel)] if part)
+        bucket.blob(blob_name).upload_from_filename(str(path))
+        print(f"uploaded gs://{bucket_name}/{blob_name}")
+PY
+}
+
 sync_checkpoints() {
   echo "Syncing checkpoints to ${GCS_CHECKPOINT_URI}"
   upload_dir_to_gcs "${CHECKPOINT_DIR}" "${GCS_CHECKPOINT_URI}"
+}
+
+sync_metrics() {
+  [[ -n "${GCS_METRICS_URI:-}" ]] || return 0
+  echo "Syncing metrics to ${GCS_METRICS_URI}"
+  upload_dir_contents_to_gcs "${METRICS_DIR}" "${GCS_METRICS_URI}"
+}
+
+upload_tensorboard_once() {
+  [[ -n "${VERTEX_TENSORBOARD_RESOURCE_NAME:-}" ]] || return 0
+  command -v tb-gcp-uploader >/dev/null 2>&1 || return 0
+
+  local experiment_name="${VERTEX_TENSORBOARD_EXPERIMENT_NAME:-${EXP_NAME}}"
+  local timeout_seconds="${TENSORBOARD_FINAL_UPLOAD_TIMEOUT_SECONDS:-120}"
+  echo "Final TensorBoard upload to ${VERTEX_TENSORBOARD_RESOURCE_NAME} experiment ${experiment_name} (timeout ${timeout_seconds}s)"
+  run_with_timeout "${timeout_seconds}" tb-gcp-uploader \
+    --tensorboard_resource_name "${VERTEX_TENSORBOARD_RESOURCE_NAME}" \
+    --logdir "${TENSORBOARD_DIR}" \
+    --experiment_name "${experiment_name}" \
+    --one_shot=True
+}
+
+run_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${timeout_seconds}" "$@"
+    return
+  fi
+
+  "$@" &
+  local pid=$!
+  local elapsed=0
+  while kill -0 "${pid}" >/dev/null 2>&1; do
+    if (( elapsed >= timeout_seconds )); then
+      echo "Timed out after ${timeout_seconds}s: $*" >&2
+      kill "${pid}" >/dev/null 2>&1 || true
+      wait "${pid}" >/dev/null 2>&1 || true
+      return 124
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  wait "${pid}"
 }
 
 sync_on_exit() {
@@ -159,7 +243,15 @@ sync_on_exit() {
   if [[ -n "${checkpoint_sync_pid:-}" ]]; then
     kill "${checkpoint_sync_pid}" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${metrics_sync_pid:-}" ]]; then
+    kill "${metrics_sync_pid}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${tensorboard_upload_pid:-}" ]]; then
+    kill "${tensorboard_upload_pid}" >/dev/null 2>&1 || true
+  fi
   sync_checkpoints || true
+  sync_metrics || true
+  upload_tensorboard_once || true
   if [[ -n "${GCS_OUTPUT_URI:-}" ]]; then
     echo "Uploading outputs to ${GCS_OUTPUT_URI}"
     upload_dir_to_gcs "${OUTPUT_DIR}" "${GCS_OUTPUT_URI}"
@@ -198,7 +290,15 @@ echo "TRAIN_FILES=${TRAIN_FILES}"
 echo "VAL_FILES=${VAL_FILES}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "CHECKPOINT_DIR=${CHECKPOINT_DIR}"
+echo "METRICS_DIR=${METRICS_DIR}"
+echo "TENSORBOARD_DIR=${TENSORBOARD_DIR}"
+echo "VERL_FILE_LOGGER_PATH=${VERL_FILE_LOGGER_PATH}"
+echo "VERTEX_TENSORBOARD_RESOURCE_NAME=${VERTEX_TENSORBOARD_RESOURCE_NAME:-<empty>}"
+echo "VERTEX_TENSORBOARD_EXPERIMENT_NAME=${VERTEX_TENSORBOARD_EXPERIMENT_NAME:-${EXP_NAME}}"
+echo "VERTEX_TENSORBOARD_EXPERIMENT_URL=${VERTEX_TENSORBOARD_EXPERIMENT_URL:-<empty>}"
+echo "TENSORBOARD_FINAL_UPLOAD_TIMEOUT_SECONDS=${TENSORBOARD_FINAL_UPLOAD_TIMEOUT_SECONDS:-120}"
 echo "GCS_CHECKPOINT_URI=${GCS_CHECKPOINT_URI}"
+echo "GCS_METRICS_URI=${GCS_METRICS_URI:-<empty>}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-<unset>}"
 echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
@@ -245,6 +345,33 @@ if [[ "${CHECKPOINT_SYNC_INTERVAL_SECONDS:-300}" != "0" ]]; then
   checkpoint_sync_pid=$!
 fi
 
+metrics_sync_pid=""
+if [[ -n "${GCS_METRICS_URI:-}" && "${METRICS_SYNC_INTERVAL_SECONDS:-300}" != "0" ]]; then
+  (
+    while true; do
+      sleep "${METRICS_SYNC_INTERVAL_SECONDS:-300}"
+      sync_metrics || true
+    done
+  ) &
+  metrics_sync_pid=$!
+fi
+
+tensorboard_upload_pid=""
+if [[ -n "${VERTEX_TENSORBOARD_RESOURCE_NAME:-}" ]]; then
+  VERTEX_TENSORBOARD_EXPERIMENT_NAME="${VERTEX_TENSORBOARD_EXPERIMENT_NAME:-${EXP_NAME}}"
+  if command -v tb-gcp-uploader >/dev/null 2>&1; then
+    echo "Uploading TensorBoard logs to ${VERTEX_TENSORBOARD_RESOURCE_NAME} experiment ${VERTEX_TENSORBOARD_EXPERIMENT_NAME}"
+    tb-gcp-uploader \
+      --tensorboard_resource_name "${VERTEX_TENSORBOARD_RESOURCE_NAME}" \
+      --logdir "${TENSORBOARD_DIR}" \
+      --experiment_name "${VERTEX_TENSORBOARD_EXPERIMENT_NAME}" \
+      --experiment_display_name "${VERTEX_TENSORBOARD_EXPERIMENT_NAME}" &
+    tensorboard_upload_pid=$!
+  else
+    echo "VERTEX_TENSORBOARD_RESOURCE_NAME is set, but tb-gcp-uploader was not found; continuing with GCS metrics sync only." >&2
+  fi
+fi
+
 HYDRA_ARGS=(
   "algorithm.adv_estimator=${ADV_ESTIMATOR}"
   "algorithm.use_kl_in_reward=${USE_KL_IN_REWARD:-False}"
@@ -287,7 +414,7 @@ HYDRA_ARGS=(
   "critic.model.path=${CRITIC_MODEL_PATH}"
   "critic.ppo_micro_batch_size_per_gpu=${CRITIC_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
   "trainer.critic_warmup=${CRITIC_WARMUP:-0}"
-  "trainer.logger=${TRAINER_LOGGER:-[\"console\"]}"
+  "trainer.logger=${TRAINER_LOGGER:-[\"console\",\"tensorboard\",\"file\"]}"
   "trainer.val_before_train=${VAL_BEFORE_TRAIN:-False}"
   "trainer.n_gpus_per_node=${N_GPUS}"
   "trainer.nnodes=${NNODES:-1}"

@@ -50,6 +50,10 @@ check_gcs_object "TRAIN_FILES" "${TRAIN_FILES}"
 check_gcs_object "VAL_FILES" "${VAL_FILES}"
 check_gcs_prefix "GCS_CHECKPOINT_URI" "${GCS_CHECKPOINT_URI}"
 
+if [[ -n "${GCS_METRICS_URI:-}" ]]; then
+  check_gcs_prefix "GCS_METRICS_URI" "${GCS_METRICS_URI}"
+fi
+
 if [[ -n "${GCS_OUTPUT_URI:-}" ]]; then
   check_gcs_prefix "GCS_OUTPUT_URI" "${GCS_OUTPUT_URI}"
 fi

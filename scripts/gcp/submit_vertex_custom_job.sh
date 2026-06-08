@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=load_env.sh
 source "${SCRIPT_DIR}/load_env.sh"
+# shellcheck source=tensorboard_utils.sh
+source "${SCRIPT_DIR}/tensorboard_utils.sh"
 
 usage() {
   cat <<'EOF'
@@ -72,6 +74,11 @@ require_env GCS_CHECKPOINT_URI
 
 VERTEX_JOB_NAME="${VERTEX_JOB_NAME:-verl-rl-$(date +%Y%m%d-%H%M%S)}"
 TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-/workspace/verl/scripts/gcp/train.sh}"
+if [[ -n "${VERTEX_TENSORBOARD_RESOURCE_NAME:-}" ]]; then
+  TRAINER_LOGGER="$(ensure_tensorboard_logger "${TRAINER_LOGGER:-}")"
+  VERTEX_TENSORBOARD_EXPERIMENT_NAME="${VERTEX_TENSORBOARD_EXPERIMENT_NAME:-${EXP_NAME:-verl-run}}"
+  VERTEX_TENSORBOARD_EXPERIMENT_URL="${VERTEX_TENSORBOARD_EXPERIMENT_URL:-$(tensorboard_experiment_url "${REGION}" "${VERTEX_TENSORBOARD_RESOURCE_NAME}" "${VERTEX_TENSORBOARD_EXPERIMENT_NAME}")}"
+fi
 if [[ -z "${TOTAL_TRAINING_STEPS+x}" && -z "${TOTAL_EPOCHS:-}" ]]; then
   RESOLVED_TOTAL_TRAINING_STEPS=2
 else
@@ -146,12 +153,19 @@ yaml_env KL_COEF "${KL_COEF:-0.001}"
 yaml_env KL_LOSS_COEF "${KL_LOSS_COEF:-0.001}"
 yaml_env SAVE_FREQ "${SAVE_FREQ:-1}"
 yaml_env TEST_FREQ "${TEST_FREQ:-1}"
-yaml_env TRAINER_LOGGER "${TRAINER_LOGGER:-[\"console\"]}"
+yaml_env TRAINER_LOGGER "${TRAINER_LOGGER:-[\"console\",\"tensorboard\",\"file\"]}"
 yaml_env GCS_OUTPUT_URI "${GCS_OUTPUT_URI:-}"
 yaml_env GCS_CHECKPOINT_URI "${GCS_CHECKPOINT_URI}"
+yaml_env GCS_METRICS_URI "${GCS_METRICS_URI:-}"
 yaml_env CHECKPOINT_SYNC_INTERVAL_SECONDS "${CHECKPOINT_SYNC_INTERVAL_SECONDS:-300}"
+yaml_env METRICS_SYNC_INTERVAL_SECONDS "${METRICS_SYNC_INTERVAL_SECONDS:-300}"
 yaml_env DATA_DIR "${DATA_DIR:-/workspace/data}"
 yaml_env OUTPUT_DIR "${OUTPUT_DIR:-/workspace/outputs/${EXP_NAME:-verl-run}}"
+yaml_env METRICS_DIR "${METRICS_DIR:-/workspace/outputs/${EXP_NAME:-verl-run}/metrics}"
+yaml_env VERTEX_TENSORBOARD_RESOURCE_NAME "${VERTEX_TENSORBOARD_RESOURCE_NAME:-}"
+yaml_env VERTEX_TENSORBOARD_EXPERIMENT_NAME "${VERTEX_TENSORBOARD_EXPERIMENT_NAME:-${EXP_NAME:-verl-run}}"
+yaml_env VERTEX_TENSORBOARD_EXPERIMENT_URL "${VERTEX_TENSORBOARD_EXPERIMENT_URL:-}"
+yaml_env TENSORBOARD_FINAL_UPLOAD_TIMEOUT_SECONDS "${TENSORBOARD_FINAL_UPLOAD_TIMEOUT_SECONDS:-120}"
 yaml_env TRAIN_FILES "${TRAIN_FILES}"
 yaml_env VAL_FILES "${VAL_FILES}"
 yaml_env EXTRA_HYDRA_ARGS "${EXTRA_HYDRA_ARGS:-}"
@@ -176,6 +190,9 @@ fi
 
 echo "Submitting Vertex AI CustomJob ${VERTEX_JOB_NAME}"
 echo "Config: ${CONFIG_FILE}"
+if [[ -n "${VERTEX_TENSORBOARD_EXPERIMENT_URL:-}" ]]; then
+  echo "TensorBoard: ${VERTEX_TENSORBOARD_EXPERIMENT_URL}"
+fi
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   cat <<EOF
@@ -198,3 +215,6 @@ gcloud ai custom-jobs create \
 
 echo "Submitted ${VERTEX_JOB_NAME}"
 echo "Console: https://console.cloud.google.com/vertex-ai/locations/${REGION}/training/custom-jobs?project=${PROJECT_ID}"
+if [[ -n "${VERTEX_TENSORBOARD_EXPERIMENT_URL:-}" ]]; then
+  echo "TensorBoard: ${VERTEX_TENSORBOARD_EXPERIMENT_URL}"
+fi

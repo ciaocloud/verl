@@ -6,7 +6,7 @@ WORKDIR /workspace/verl
 COPY . /workspace/verl
 
 RUN python3 -m pip install --no-deps -e /workspace/verl \
-    && python3 -m pip install google-cloud-storage
+    && python3 -m pip install google-cloud-storage 'google-cloud-aiplatform[tensorboard]' tensorflow tensorboard
 
 ENV PYTHONUNBUFFERED=1
 ENV TOKENIZERS_PARALLELISM=false

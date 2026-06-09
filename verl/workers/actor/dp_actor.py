@@ -101,14 +101,29 @@ class DataParallelPPOActor(BasePPOActor):
         # LOTIS modules (learnable sequence/token weighting)
         # Wrapped in DDP to sync across actor workers
         self.lotis_length_module = None
+        self.lotis_sequence_module = None
         self.lotis_token_module = None
         self.need_hidden_states = False
         self.need_ref_log_prob = False
+        self.need_response_ids = False
 
         lotis_config = self.config.get("lotis", None)
         if lotis_config is not None and actor_optimizer is not None:
             from verl.lotis.modules import RBFLengthWeightModule, KLTokenWeightModule, MLPTokenWeightModule
-            
+
+            # RBF length weighting and the MLP sequence meta-critic both produce a
+            # per-sequence phi; they are mutually exclusive alternatives.
+            seq_weight_cfg = lotis_config.get("sequence_weight", None)
+            if (
+                getattr(lotis_config.length_weight, "enable", False)
+                and seq_weight_cfg is not None
+                and getattr(seq_weight_cfg, "enable", False)
+            ):
+                raise ValueError(
+                    "LOTIS: length_weight (RBF) and sequence_weight (MLP meta-critic) both "
+                    "produce phi and are mutually exclusive. Enable only one."
+                )
+
             lotis_params = []
             if getattr(lotis_config.length_weight, "enable", False):
                 self.lotis_length_module = RBFLengthWeightModule(lotis_config.length_weight).to(get_device_id())
@@ -124,7 +139,41 @@ class DataParallelPPOActor(BasePPOActor):
                 })
                 if torch.distributed.get_rank() == 0:
                     print(f"LOTIS: phi module enabled (DDP), K={lotis_config.length_weight.num_rbf_kernels}")
-            
+
+            if seq_weight_cfg is not None and getattr(seq_weight_cfg, "enable", False):
+                from verl.lotis.sequence_module import MLPSequenceWeightModule
+
+                self.lotis_sequence_module = MLPSequenceWeightModule(seq_weight_cfg).to(get_device_id())
+                # Feature toggles drive which inputs the forward pass must produce.
+                if seq_weight_cfg.use_semantic_drift:
+                    self.need_hidden_states = True
+                if seq_weight_cfg.use_accumulated_kl:
+                    self.need_ref_log_prob = True
+                if seq_weight_cfg.use_repetition:
+                    self.need_response_ids = True
+                if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                    self.lotis_sequence_module = torch.nn.parallel.DistributedDataParallel(
+                        self.lotis_sequence_module, device_ids=[get_device_id()]
+                    )
+                lotis_params.append({
+                    "params": self.lotis_sequence_module.parameters(),
+                    "lr": seq_weight_cfg.lr,
+                    "weight_decay": seq_weight_cfg.weight_decay,
+                })
+                if torch.distributed.get_rank() == 0:
+                    enabled = [
+                        n for n, on in [
+                            ("length", seq_weight_cfg.use_length),
+                            ("entropy", seq_weight_cfg.use_entropy),
+                            ("pass_rate", seq_weight_cfg.use_pass_rate),
+                            ("repetition", seq_weight_cfg.use_repetition),
+                            ("truncation", seq_weight_cfg.use_truncation),
+                            ("semantic_drift", seq_weight_cfg.use_semantic_drift),
+                            ("accumulated_kl", seq_weight_cfg.use_accumulated_kl),
+                        ] if on
+                    ]
+                    print(f"LOTIS: sequence meta-critic (MLP) enabled, features=[{','.join(enabled)}]")
+
             if getattr(lotis_config.token_weight, "enable", False):
                 if lotis_config.token_weight.mode == "mlp":
                     # Determine hidden dim from actor config
@@ -723,7 +772,25 @@ class DataParallelPPOActor(BasePPOActor):
                         group_indices = micro_batch.non_tensor_batch.get("uid", None)
                         phi_weights, phi_metrics = self.lotis_length_module(response_mask, group_indices=group_indices)
                         micro_batch_metrics.update(phi_metrics)
-                    
+
+                    # MLP sequence meta-critic (VRPO-33) — alternative phi producer to RBF.
+                    if self.lotis_sequence_module is not None:
+                        group_indices = micro_batch.non_tensor_batch.get("uid", None)
+                        ref_log_prob = model_inputs.get("ref_log_prob", None)
+                        response_ids = model_inputs.get("responses", None) if self.need_response_ids else None
+                        phi_weights, seq_metrics = self.lotis_sequence_module(
+                            response_mask,
+                            group_indices=group_indices,
+                            entropy=entropy,
+                            advantages=advantages,
+                            response_ids=response_ids,
+                            hidden_states=hidden_states,
+                            log_prob=log_prob,
+                            ref_log_prob=ref_log_prob,
+                            max_len=response_mask.shape[-1],
+                        )
+                        micro_batch_metrics.update(seq_metrics)
+
                     if self.lotis_token_module is not None:
                         if self.need_hidden_states and hidden_states is not None:
                             # Build features dict for MLP token weight module

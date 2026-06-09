@@ -17,9 +17,10 @@ Note: For TIS, ref_log_prob must be in batch (from reference model).
       The actor auto-includes it when TIS is enabled.
 """
 
-from verl.lotis.config import LOTISConfig, LengthWeightConfig, TokenWeightConfig
+from verl.lotis.config import LOTISConfig, LengthWeightConfig, SequenceWeightConfig, TokenWeightConfig
 from verl.lotis.modules import RBFLengthWeightModule, KLTokenWeightModule, MLPTokenWeightModule
-# Note: compute_lotis_policy_loss is NOT imported here to avoid circular imports with verl.workers.config. 
+from verl.lotis.sequence_module import MLPSequenceWeightModule
+# Note: compute_lotis_policy_loss is NOT imported here to avoid circular imports with verl.workers.config.
 # It must be imported where needed (e.g. in actors) to ensure registration.
 
 __all__ = [
@@ -27,8 +28,10 @@ __all__ = [
     "LOTISConfig",
     "LengthWeightConfig",
     "TokenWeightConfig",
+    "SequenceWeightConfig",
     # Modules
     "RBFLengthWeightModule",
     "KLTokenWeightModule",
     "MLPTokenWeightModule",
+    "MLPSequenceWeightModule",
 ]

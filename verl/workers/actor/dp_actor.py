@@ -728,12 +728,17 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    # Force entropy calculation if LOTIS MLP needs it
-                    lotis_needs_entropy = (
-                        self.lotis_token_module is not None 
+                    # Force entropy calculation if a LOTIS MLP needs it (token or sequence).
+                    token_needs_entropy = (
+                        self.lotis_token_module is not None
                         and self.need_hidden_states  # MLP mode
                         and getattr(self.config.lotis.token_weight, "use_entropy", False)
                     )
+                    seq_needs_entropy = (
+                        self.lotis_sequence_module is not None
+                        and getattr(self.config.lotis.sequence_weight, "use_entropy", False)
+                    )
+                    lotis_needs_entropy = token_needs_entropy or seq_needs_entropy
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0) or lotis_needs_entropy
 
                     if self.config.use_dynamic_bsz:

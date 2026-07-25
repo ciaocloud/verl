@@ -1,0 +1,61 @@
+# Vertex AI (Agent Platform) CustomJob spec for the lab/gcp runner image.
+#
+# The image bakes only deps + bootstrap.sh. At startup bootstrap.sh clones the
+# fork at GIT_REF and runs the pulled scripts/gcp/train.sh, so code changes ship
+# via `git push` + resubmit with NO image rebuild.
+#
+# Copy to lab/gcp/jobspec.<name>.yaml, fill in the CAPS placeholders, submit:
+#   lab/gcp/submit.sh lab/gcp/jobspec.<name>.yaml
+#
+# For distinct runs bump EXP_NAME and GCS_CHECKPOINT_URI so runs don't overwrite
+# each other's checkpoints.
+
+workerPoolSpecs:
+  - replicaCount: 1
+    machineSpec:
+      machineType: g2-standard-16
+      acceleratorType: NVIDIA_L4
+      acceleratorCount: 1
+    containerSpec:
+      imageUri: REGION-docker.pkg.dev/PROJECT_ID/verl-rl/verl-gcp-runner:runner
+      # No command/args needed: the image ENTRYPOINT is bootstrap.sh, which
+      # pulls code and execs train.sh. Override only to change the entrypoint.
+      env:
+        # ── Code selection (read by bootstrap.sh) ──────────────────────────
+        - {name: GIT_REMOTE, value: "https://github.com/ciaocloud/verl.git"}
+        - {name: GIT_REF, value: "lotis"}   # branch/tag, or pin a commit SHA
+
+        # ── GPU visibility / CUDA libs ─────────────────────────────────────
+        - {name: N_GPUS, value: "1"}
+        - {name: NVIDIA_VISIBLE_DEVICES, value: "all"}
+        - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+        - {name: LD_LIBRARY_PATH, value: "/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/compat:/usr/local/cuda/lib64"}
+
+        # ── Experiment identity ────────────────────────────────────────────
+        - {name: PROJECT_NAME, value: "verl_gcp"}
+        - {name: EXP_NAME, value: "lotis-rbf"}
+
+        # ── Model + algorithm ──────────────────────────────────────────────
+        - {name: MODEL_PATH, value: "Qwen/Qwen2.5-0.5B-Instruct"}
+        - {name: RL_ALGORITHM, value: "grpo"}
+
+        # ── Required storage (MUST be gs:// URIs) ──────────────────────────
+        - {name: TRAIN_FILES, value: "gs://YOUR_BUCKET/datasets/gsm8k/train.parquet"}
+        - {name: VAL_FILES, value: "gs://YOUR_BUCKET/datasets/gsm8k/test.parquet"}
+        - {name: GCS_CHECKPOINT_URI, value: "gs://YOUR_BUCKET/checkpoints/lotis-rbf"}
+        - {name: CHECKPOINT_SYNC_INTERVAL_SECONDS, value: "300"}
+        # Optional: copy /workspace/outputs/$EXP_NAME at the end.
+        # - {name: GCS_OUTPUT_URI, value: "gs://YOUR_BUCKET/outputs/lotis-rbf"}
+
+        # ── Run length (smoke default = 2 steps) ───────────────────────────
+        - {name: TOTAL_TRAINING_STEPS, value: "2"}
+
+        # ── Trainer + LOTIS flags (semicolon-separated). RBF-only run. ─────
+        - {name: EXTRA_HYDRA_ARGS, value: "custom_reward_function.path=verl/lab/reward.py;custom_reward_function.name=compute_score;actor_rollout_ref.actor.lotis.length_weight.enable=True;actor_rollout_ref.actor.lotis.length_weight.lr=0.01;actor_rollout_ref.actor.lotis.token_weight.enable=False"}
+
+scheduling:
+  timeout: 7200s
+
+# Optional: service account with Artifact Registry read + GCS read/write +
+# Vertex AI permissions. Remove to use the default compute service account.
+# serviceAccount: SA_NAME@PROJECT_ID.iam.gserviceaccount.com

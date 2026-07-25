@@ -1,0 +1,54 @@
+# Test-run Vertex AI CustomJob for the lab/gcp runner image.
+#
+# Submit with:  lab/gcp/submit.sh lab/gcp/jobspec.lotis-test.yaml
+#
+# This is a SMOKE TEST: TOTAL_TRAINING_STEPS=2 and a small batch so it exercises
+# the full path (image boot -> git pull -> data stage-in -> train -> checkpoint
+# sync) cheaply. Tune real experiment config later.
+
+workerPoolSpecs:
+  - replicaCount: 1
+    machineSpec:
+      machineType: g2-standard-16
+      acceleratorType: NVIDIA_L4
+      acceleratorCount: 1
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/ciao-rl-paper/ciao-verl-ar/ciao-verl:runner
+      # ENTRYPOINT is bootstrap.sh; it pulls GIT_REF and execs TRAIN_ENTRYPOINT.
+      env:
+        # ── Code selection ────────────────────────────────────────────────
+        - {name: GIT_REF, value: "lotis"}
+        - {name: TRAIN_ENTRYPOINT, value: "lab/gcp/train.sh"}
+
+        # ── GPU / CUDA ────────────────────────────────────────────────────
+        - {name: N_GPUS, value: "1"}
+        - {name: NVIDIA_VISIBLE_DEVICES, value: "all"}
+        - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+        - {name: LD_LIBRARY_PATH, value: "/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/compat:/usr/local/cuda/lib64"}
+
+        # ── Experiment identity ───────────────────────────────────────────
+        - {name: PROJ_NAME, value: "verl-lotis"}
+        - {name: EXP_NAME, value: "lotis-test"}
+
+        # ── Required storage (gs:// URIs) ─────────────────────────────────
+        - {name: TRAIN_FILES, value: "gs://ciao-verl/datasets/gsm8k/train.parquet"}
+        - {name: VAL_FILES, value: "gs://ciao-verl/datasets/gsm8k/test.parquet"}
+        - {name: GCS_CHECKPOINT_URI, value: "gs://ciao-verl/checkpoints/lotis-test"}
+        - {name: CHECKPOINT_SYNC_INTERVAL_SECONDS, value: "300"}
+
+        # ── Smoke-test overrides (keep it cheap/fast) ─────────────────────
+        - {name: TOTAL_TRAINING_STEPS, value: "2"}
+        - {name: TRAIN_BATCH_SIZE, value: "16"}
+        - {name: PPO_MINI_BATCH_SIZE, value: "8"}
+        - {name: ROLLOUT_N, value: "2"}
+        - {name: SAVE_FREQ, value: "1"}
+        - {name: TEST_FREQ, value: "1"}
+        - {name: MAX_RESPONSE_LENGTH, value: "512"}
+
+        # ── LOTIS: RBF-only (length weighting on, token off) ──────────────
+        - {name: LOTIS_LENGTH_ENABLE, value: "True"}
+        - {name: LOTIS_LENGTH_LR, value: "0.01"}
+        - {name: LOTIS_TOKEN_ENABLE, value: "False"}
+
+scheduling:
+  timeout: 3600s

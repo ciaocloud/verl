@@ -1,0 +1,88 @@
+workerPoolSpecs:
+  - replicaCount: 1
+    machineSpec:
+      machineType: g2-standard-16
+      acceleratorType: NVIDIA_L4
+      acceleratorCount: 1
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/ciao-rl-paper/ciao-verl-ar/ciao-verl:runner
+      # ENTRYPOINT is bootstrap.sh; it pulls GIT_REF and execs TRAIN_ENTRYPOINT.
+      env:
+        # ── Code selection ────────────────────────────────────────────────
+        - {name: GIT_REF, value: "lotis"}
+        - {name: TRAIN_ENTRYPOINT, value: "lab/gcp/train.sh"}
+
+        # ── GPU / CUDA ────────────────────────────────────────────────────
+        # - {name: N_GPUS, value: "1"}
+        - {name: NVIDIA_VISIBLE_DEVICES, value: "all"}
+        - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+        - {name: LD_LIBRARY_PATH, value: "/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/compat:/usr/local/cuda/lib64"}
+
+        # ── Run identity + storage (train.sh glue) ────────────────────────
+        - {name: PROJ_NAME, value: "ciao-lab"}
+        - {name: MODEL_SIZE, value: "0.5B"}
+        - {name: DATASET, value: "gsm8k"}
+        - {name: ALG, value: "lotis"}
+        - {name: GCS_BUCKET, value: "gs://ciao-verl"}
+        # - {name: EXP_NAME, value: "LENRBF-0.5B-gsm8k-test"}
+        # - {name: DATA_DIR, value: "gs://ciao-verl/datasets/"}
+        # - {name: GCS_CHECKPOINT_URI, value: "gs://ciao-verl/checkpoints"}
+        # - {name: CHECKPOINT_SYNC_INTERVAL_SECONDS, value: "300"}
+        # Resume from latest checkpoint if present (default; explicit for clarity).
+        # - {name: RESUME_MODE, value: "auto"}
+
+        # ── Experiment config: full self-contained Hydra override list ────
+        # This is the whole recipe for the run. Copy this file per model /
+        # experiment and edit freely; train.sh appends only runtime facts
+        # (reward path, staged data paths, n_gpus, run identity) after these.
+        # Mirrors lab/lotis/run_0.5b_lab.sh (0.5B/1-GPU) with smoke-test sizing.
+        - name: HYDRA_OVERRIDES
+          value: |
+            custom_reward_function.name=compute_score
+            algorithm.adv_estimator=grpo
+            algorithm.use_kl_in_reward=False
+            data.train_batch_size=16
+            data.max_prompt_length=512
+            data.max_response_length=1024
+            data.filter_overlong_prompts=True
+            data.truncation=error
+            actor_rollout_ref.model.path=Qwen/Qwen2.5-$(MODEL_SIZE)-Instruct
+            actor_rollout_ref.model.use_remove_padding=True
+            actor_rollout_ref.model.enable_gradient_checkpointing=True
+            actor_rollout_ref.actor.optim.lr=1e-6
+            actor_rollout_ref.actor.ppo_mini_batch_size=64
+            actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
+            actor_rollout_ref.actor.fsdp_config.param_offload=True
+            actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+            actor_rollout_ref.actor.lotis.length_weight.enable=True
+            actor_rollout_ref.actor.lotis.length_weight.lr=0.01
+            actor_rollout_ref.actor.lotis.token_weight.enable=False
+            actor_rollout_ref.actor.lotis.token_weight.lr=0.001
+            actor_rollout_ref.actor.use_kl_loss=True
+            actor_rollout_ref.actor.kl_loss_coef=0.001
+            actor_rollout_ref.actor.kl_loss_type=low_var_kl
+            actor_rollout_ref.actor.entropy_coeff=0
+            actor_rollout_ref.actor.checkpoint.save_contents=[model,optimizer,extra,hf_model]
+            actor_rollout_ref.rollout.name=vllm
+            actor_rollout_ref.rollout.tensor_model_parallel_size=1
+            actor_rollout_ref.rollout.gpu_memory_utilization=0.35
+            actor_rollout_ref.rollout.n=5
+            actor_rollout_ref.rollout.temperature=1.0
+            actor_rollout_ref.rollout.top_p=1.0
+            actor_rollout_ref.rollout.top_k=-1
+            actor_rollout_ref.rollout.val_kwargs.n=1
+            actor_rollout_ref.rollout.val_kwargs.temperature=1.0
+            actor_rollout_ref.rollout.val_kwargs.top_p=0.7
+            actor_rollout_ref.rollout.val_kwargs.top_k=-1
+            actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4
+            actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4
+            trainer.logger=[console, tensorboard]
+            trainer.log_val_generations=1
+            trainer.val_before_train=False
+            trainer.save_freq=1
+            trainer.test_freq=1
+            trainer.total_training_steps=2
+
+scheduling:
+  timeout: 3600s
+  

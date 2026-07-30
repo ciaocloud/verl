@@ -1,37 +1,39 @@
 #!/usr/bin/env bash
 # LOTIS training entrypoint for Vertex AI (Agent Platform) CustomJob.
 #
-# Standalone cloud runner. Mirrors the trainer invocation in
-# lab/lotis/run_0.5b_lab.sh, plus the cloud glue that script omits:
+# Standalone cloud runner. It owns only the cloud glue; ALL experiment config
+# (algorithm, model, batch sizes, LOTIS knobs, epochs/steps, ...) is passed as
+# raw Hydra overrides via the HYDRA_OVERRIDES env var in the jobspec. The glue:
 #   - stage TRAIN_FILES/VAL_FILES from GCS to local disk,
 #   - run the trainer in the FOREGROUND (so the container lives until it ends),
 #   - sync checkpoints + tensorboard back to GCS periodically and on exit.
 #
 # bootstrap.sh execs this by default (TRAIN_ENTRYPOINT=lab/gcp/train.sh).
 #
-# Required env: TRAIN_FILES, VAL_FILES, GCS_CHECKPOINT_URI (all gs:// URIs).
-# Common knobs (optional, with defaults): EXP_NAME PROJ_NAME MODEL_PATH
-#   TOTAL_EPOCHS N_GPUS TRAIN_BATCH_SIZE PPO_MINI_BATCH_SIZE ROLLOUT_N
-#   GPU_MEMORY_UTILIZATION MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH SAVE_FREQ
-#   TEST_FREQ LOTIS_LENGTH_ENABLE LOTIS_LENGTH_LR LOTIS_TOKEN_ENABLE
-#   LOTIS_TOKEN_LR CHECKPOINT_SYNC_INTERVAL_SECONDS EXTRA_HYDRA_ARGS.
+# Config env:   HYDRA_OVERRIDES — newline- or ';'-separated Hydra override lines
+#               (e.g. "algorithm.adv_estimator=grpo;actor_rollout_ref.rollout.n=5").
+#               '#'-prefixed and blank lines are ignored.
+# Glue knobs (optional): EXP_NAME PROJ_NAME N_GPUS CHECKPOINT_SYNC_INTERVAL_SECONDS.
 set -Eeuo pipefail
 
 cd "${VERL_WORKDIR:-/workspace/verl}"
 
-EXP_NAME="${EXP_NAME:-lotis-run}"
-PROJ_NAME="${PROJ_NAME:-verl-lotis}"
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-0.5B-Instruct}"
+# Experiment name. If EXP_NAME is set explicitly it's used as-is; otherwise it's
+# composed like the power scripts: <ALG>-<MODEL_SIZE>-<DATASET>-<MMDDHH>, e.g.
+# LENRBF-0.5B-gsm8k-072714. Set ALG/MODEL_SIZE/DATASET in the jobspec.
+if [[ -z "${DATE:-}" ]]; then
+  DATE=$(date +%m%d%H)
+fi
+if [[ -z "${EXP_NAME:-}" ]]; then
+  EXP_NAME="${ALG:-go}-${MODEL_SIZE:-0.5B}-${DATASET:-gsm8k}-${DATE}"
+fi
+PROJ_NAME="${PROJ_NAME:-verl-go}"
 DATA_DIR="${DATA_DIR:-/workspace/data}"
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/outputs/${EXP_NAME}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${OUTPUT_DIR}/checkpoints}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tensorboard}"
 export RAY_ADDRESS="${RAY_ADDRESS:-local}"
 
-if [[ -z "${TRAIN_FILES:-}" || -z "${VAL_FILES:-}" || -z "${GCS_CHECKPOINT_URI:-}" ]]; then
-  echo "Missing required env: TRAIN_FILES, VAL_FILES, GCS_CHECKPOINT_URI (all gs:// URIs)." >&2
-  exit 1
-fi
 
 if [[ -z "${N_GPUS:-}" ]]; then
   N_GPUS="$(command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L | wc -l | tr -d ' ' || echo 1)"
@@ -53,6 +55,28 @@ print(f"staged {uri} -> {dst}")
 PY
 }
 
+gcs_download_dir() { # gs://bucket/prefix  /local/dir   (no-op if prefix empty)
+  python3 - "$1" "$2" <<'PY'
+import sys
+from pathlib import Path
+from google.cloud import storage
+uri, dst = sys.argv[1], Path(sys.argv[2])
+bucket, _, prefix = uri[5:].partition("/")
+prefix = prefix.rstrip("/")
+client = storage.Client()
+n = 0
+for blob in client.list_blobs(bucket, prefix=prefix + "/" if prefix else None):
+    if blob.name.endswith("/"):
+        continue
+    rel = blob.name[len(prefix):].lstrip("/") if prefix else blob.name
+    out = dst / rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    blob.download_to_filename(str(out))
+    n += 1
+print(f"staged {n} files from {uri} -> {dst}")
+PY
+}
+
 gcs_upload_dir() { # /local/dir  gs://bucket/prefix
   [[ -d "$1" ]] || return 0
   python3 - "$1" "$2" <<'PY'
@@ -69,6 +93,7 @@ for p in src.rglob("*"):
 PY
 }
 
+GCS_CHECKPOINT_URI="${GCS_CHECKPOINT_URI:-${GCS_BUCKET}/${EXP_NAME}}"
 sync_to_gcs() {
   echo "Syncing checkpoints + tensorboard to ${GCS_CHECKPOINT_URI}"
   gcs_upload_dir "${CHECKPOINT_DIR}" "${GCS_CHECKPOINT_URI%/}/checkpoints" || true
@@ -86,8 +111,22 @@ trap on_exit EXIT
 # ── Stage data from GCS ───────────────────────────────────────────────────────
 TRAIN_LOCAL="${DATA_DIR}/train.parquet"
 VAL_LOCAL="${DATA_DIR}/val.parquet"
-gcs_download "${TRAIN_FILES}" "${TRAIN_LOCAL}"
-gcs_download "${VAL_FILES}" "${VAL_LOCAL}"
+if [[ -z "${TRAIN_DATA:-}" ]]; then
+  TRAIN_DATA="${GCS_BUCKET}/datasets/${DATASET}/train.parquet"
+fi
+if [[ -z "${VAL_DATA:-}" ]]; then
+  VAL_DATA="${GCS_BUCKET}/datasets/${DATASET}/test.parquet"
+fi
+gcs_download "${TRAIN_DATA}" "${TRAIN_LOCAL}"
+gcs_download "${VAL_DATA}" "${VAL_LOCAL}"
+
+# ── Stage prior checkpoints back down (preemption resume) ─────────────────────
+# On a preempted/retried job the local disk is fresh, so pull any checkpoints we
+# previously synced to GCS into CHECKPOINT_DIR. verl's resume_mode=auto then
+# finds latest_checkpointed_iteration.txt + global_step_N/ and continues. This
+# is a no-op on the first run (nothing in GCS yet). EXP_NAME must be stable
+# across retries for the GCS path to match — pin it if the job may be preempted.
+gcs_download_dir "${GCS_CHECKPOINT_URI%/}/checkpoints" "${CHECKPOINT_DIR}" || true
 
 # ── Periodic checkpoint sync in background ────────────────────────────────────
 sync_pid=""
@@ -98,71 +137,38 @@ fi
 
 export TENSORBOARD_DIR
 
-# ── Trainer invocation (mirrors lab/lotis/run_0.5b_lab.sh; foreground) ─────────
-HYDRA_ARGS=(
+# ── Trainer invocation ────────────────────────────────────────────────────────
+# The full experiment config lives in the jobspec's HYDRA_OVERRIDES (one raw
+# Hydra override per line). Each model/experiment gets its own self-contained
+# jobspec YAML — edit it and resubmit; no git push, no image rebuild.
+#
+# In Hydra the LATER arg wins on a collision, so we append the runtime facts
+# (staged data paths, real GPU count, run identity) AFTER HYDRA_OVERRIDES — they
+# reflect container truth and must not be overridable by a stray jobspec line.
+HYDRA_ARGS=()
+
+# Experiment config from the jobspec: one override per line; skip blanks/comments.
+if [[ -n "${HYDRA_OVERRIDES:-}" ]]; then
+  while IFS= read -r arg; do
+    arg="${arg#"${arg%%[![:space:]]*}"}"   # ltrim
+    [[ -n "${arg}" ]] || continue          # skip blank lines
+    [[ "${arg:0:1}" != "#" ]] || continue  # skip comment lines
+    HYDRA_ARGS+=("${arg}")
+  done <<< "${HYDRA_OVERRIDES}"
+fi
+
+# Runtime facts — appended last so they win over anything in HYDRA_OVERRIDES.
+HYDRA_ARGS+=(
   custom_reward_function.path="${VERL_WORKDIR:-/workspace/verl}/lab/reward.py"
-  custom_reward_function.name=compute_score
-  algorithm.adv_estimator=grpo
-  algorithm.use_kl_in_reward=False
   data.train_files="${TRAIN_LOCAL}"
   data.val_files="${VAL_LOCAL}"
-  data.train_batch_size="${TRAIN_BATCH_SIZE:-256}"
-  data.max_prompt_length="${MAX_PROMPT_LENGTH:-512}"
-  data.max_response_length="${MAX_RESPONSE_LENGTH:-1024}"
-  data.filter_overlong_prompts=True
-  data.truncation=error
-  actor_rollout_ref.model.path="${MODEL_PATH}"
-  actor_rollout_ref.model.use_remove_padding=True
-  actor_rollout_ref.model.enable_gradient_checkpointing=True
-  actor_rollout_ref.actor.optim.lr="${ACTOR_LR:-1e-6}"
-  actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE:-64}"
-  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}"
-  actor_rollout_ref.actor.fsdp_config.param_offload=True
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
-  actor_rollout_ref.actor.lotis.length_weight.enable="${LOTIS_LENGTH_ENABLE:-True}"
-  actor_rollout_ref.actor.lotis.length_weight.lr="${LOTIS_LENGTH_LR:-0.01}"
-  actor_rollout_ref.actor.lotis.token_weight.enable="${LOTIS_TOKEN_ENABLE:-False}"
-  actor_rollout_ref.actor.lotis.token_weight.lr="${LOTIS_TOKEN_LR:-0.001}"
-  actor_rollout_ref.actor.use_kl_loss=True
-  actor_rollout_ref.actor.kl_loss_coef=0.001
-  actor_rollout_ref.actor.kl_loss_type=low_var_kl
-  actor_rollout_ref.actor.entropy_coeff=0
-  actor_rollout_ref.rollout.name=vllm
-  actor_rollout_ref.rollout.tensor_model_parallel_size=1
-  actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.35}"
-  actor_rollout_ref.rollout.n="${ROLLOUT_N:-5}"
-  actor_rollout_ref.rollout.temperature=1.0
-  actor_rollout_ref.rollout.top_p=1.0
-  actor_rollout_ref.rollout.top_k=-1
-  actor_rollout_ref.rollout.val_kwargs.n=1
-  actor_rollout_ref.rollout.val_kwargs.temperature=1.0
-  actor_rollout_ref.rollout.val_kwargs.top_p=0.7
-  actor_rollout_ref.rollout.val_kwargs.top_k=-1
-  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-4}"
-  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-4}"
-  trainer.logger=[console,tensorboard]
-  trainer.log_val_generations=1
-  trainer.val_before_train="${VAL_BEFORE_TRAIN:-False}"
   trainer.n_gpus_per_node="${N_GPUS}"
-  trainer.nnodes=1
-  trainer.save_freq="${SAVE_FREQ:-10}"
-  trainer.test_freq="${TEST_FREQ:-10}"
   trainer.project_name="${PROJ_NAME}"
   trainer.experiment_name="${EXP_NAME}"
   trainer.default_local_dir="${CHECKPOINT_DIR}"
+  trainer.resume_mode="${RESUME_MODE:-auto}"
 )
 
-if [[ -n "${TOTAL_TRAINING_STEPS:-}" ]]; then
-  HYDRA_ARGS+=(trainer.total_training_steps="${TOTAL_TRAINING_STEPS}")
-else
-  HYDRA_ARGS+=(trainer.total_epochs="${TOTAL_EPOCHS:-3}")
-fi
-
-if [[ -n "${EXTRA_HYDRA_ARGS:-}" ]]; then
-  while IFS= read -r arg; do
-    [[ -n "${arg// }" ]] && HYDRA_ARGS+=("${arg}")
-  done < <(printf '%s\n' "${EXTRA_HYDRA_ARGS}" | tr ';' '\n')
-fi
-
-echo "Starting LOTIS training: exp=${EXP_NAME} model=${MODEL_PATH} n_gpus=${N_GPUS}"
+echo "Starting LOTIS training: exp=${EXP_NAME} n_gpus=${N_GPUS}"
+printf '  %s\n' "${HYDRA_ARGS[@]}"
 python3 -m verl.trainer.main_ppo "${HYDRA_ARGS[@]}" "$@"

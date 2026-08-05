@@ -24,6 +24,7 @@ workerPoolSpecs:
         - {name: DATASET, value: "gsm8k"}
         - {name: ALG, value: "lotis"}
         - {name: GCS_BUCKET, value: "gs://ciao-verl"}
+        - {name: VERTEX_TENSORBOARD_RESOURCE_NAME, value: "projects/838672702087/locations/us-central1/tensorboards/1762299436022628352"}
         # - {name: EXP_NAME, value: "LENRBF-0.5B-gsm8k-test"}
         # - {name: DATA_DIR, value: "gs://ciao-verl/datasets/"}
         # - {name: GCS_CHECKPOINT_URI, value: "gs://ciao-verl/checkpoints"}

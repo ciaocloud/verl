@@ -100,10 +100,33 @@ sync_to_gcs() {
   gcs_upload_dir "${TENSORBOARD_DIR}" "${GCS_CHECKPOINT_URI%/}/tensorboard" || true
 }
 
+# ── Managed Vertex AI TensorBoard upload (optional) ───────────────────────────
+# If VERTEX_TENSORBOARD_RESOURCE_NAME is set, stream tensorboard events into the
+# hosted Vertex TB service so metrics are viewable live in the console (and after
+# the run). This is INDEPENDENT of the GCS sync above — verl writes local
+# tfevents; tb-gcp-uploader (baked into the image) reads them and pushes up. If
+# the var is unset, we skip and rely on the GCS mirror only.
+#   VERTEX_TENSORBOARD_RESOURCE_NAME = projects/<num>/locations/<region>/tensorboards/<id>
+#   VERTEX_TENSORBOARD_EXPERIMENT_NAME defaults to EXP_NAME (one experiment per run).
+upload_tensorboard_once() {
+  [[ -n "${VERTEX_TENSORBOARD_RESOURCE_NAME:-}" ]] || return 0
+  command -v tb-gcp-uploader >/dev/null 2>&1 || return 0
+  local exp_name="${VERTEX_TENSORBOARD_EXPERIMENT_NAME:-${EXP_NAME}}"
+  local to="${TENSORBOARD_FINAL_UPLOAD_TIMEOUT_SECONDS:-120}"
+  echo "Final TensorBoard flush to ${VERTEX_TENSORBOARD_RESOURCE_NAME} experiment ${exp_name} (timeout ${to}s)"
+  timeout "${to}" tb-gcp-uploader \
+    --tensorboard_resource_name "${VERTEX_TENSORBOARD_RESOURCE_NAME}" \
+    --logdir "${TENSORBOARD_DIR}" \
+    --experiment_name "${exp_name}" \
+    --one_shot=True || true
+}
+
 on_exit() {
   local code=$?
   [[ -n "${sync_pid:-}" ]] && kill "${sync_pid}" >/dev/null 2>&1 || true
+  [[ -n "${tb_upload_pid:-}" ]] && kill "${tb_upload_pid}" >/dev/null 2>&1 || true
   sync_to_gcs
+  upload_tensorboard_once
   exit "${code}"
 }
 trap on_exit EXIT
@@ -156,6 +179,25 @@ if [[ "${CHECKPOINT_SYNC_INTERVAL_SECONDS:-300}" != "0" ]]; then
 fi
 
 export TENSORBOARD_DIR
+
+# ── Live TensorBoard upload to managed Vertex TB (optional, background) ────────
+# Streams events to the hosted service as they're written; the on_exit trap does
+# a final --one_shot flush. No-op unless VERTEX_TENSORBOARD_RESOURCE_NAME is set.
+tb_upload_pid=""
+if [[ -n "${VERTEX_TENSORBOARD_RESOURCE_NAME:-}" ]]; then
+  VERTEX_TENSORBOARD_EXPERIMENT_NAME="${VERTEX_TENSORBOARD_EXPERIMENT_NAME:-${EXP_NAME}}"
+  if command -v tb-gcp-uploader >/dev/null 2>&1; then
+    echo "Streaming TensorBoard to ${VERTEX_TENSORBOARD_RESOURCE_NAME} experiment ${VERTEX_TENSORBOARD_EXPERIMENT_NAME}"
+    tb-gcp-uploader \
+      --tensorboard_resource_name "${VERTEX_TENSORBOARD_RESOURCE_NAME}" \
+      --logdir "${TENSORBOARD_DIR}" \
+      --experiment_name "${VERTEX_TENSORBOARD_EXPERIMENT_NAME}" \
+      --experiment_display_name "${VERTEX_TENSORBOARD_EXPERIMENT_NAME}" &
+    tb_upload_pid=$!
+  else
+    echo "VERTEX_TENSORBOARD_RESOURCE_NAME set but tb-gcp-uploader not found; GCS sync only." >&2
+  fi
+fi
 
 # ── Trainer invocation ────────────────────────────────────────────────────────
 # The full experiment config lives in the jobspec's HYDRA_OVERRIDES (one raw

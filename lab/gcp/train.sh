@@ -120,6 +120,26 @@ fi
 gcs_download "${TRAIN_DATA}" "${TRAIN_LOCAL}"
 gcs_download "${VAL_DATA}" "${VAL_LOCAL}"
 
+# ── Stage base model from GCS (optional) ──────────────────────────────────────
+# If MODEL_GCS is set (or defaulted), pull the model dir from GCS to local disk
+# and point actor_rollout_ref.model.path at it — avoids a HuggingFace download on
+# every job. Set MODEL_GCS="" in the jobspec to disable and keep the HF hub path
+# from HYDRA_OVERRIDES. Default matches the layout we upload models to:
+#   gs://<bucket>/models/Qwen2.5-<MODEL_SIZE>-Instruct
+MODEL_LOCAL=""
+if [[ -z "${MODEL_GCS+x}" ]]; then
+  MODEL_GCS="${GCS_BUCKET}/models/Qwen2.5-${MODEL_SIZE:-0.5B}-Instruct"
+fi
+if [[ -n "${MODEL_GCS}" ]]; then
+  MODEL_LOCAL="/workspace/models/$(basename "${MODEL_GCS%/}")"
+  gcs_download_dir "${MODEL_GCS}" "${MODEL_LOCAL}" || true
+  # Only use the staged model if the download actually produced a HF config.
+  if [[ ! -f "${MODEL_LOCAL}/config.json" ]]; then
+    echo "WARN: no config.json under ${MODEL_LOCAL} after staging ${MODEL_GCS}; falling back to HYDRA_OVERRIDES model.path"
+    MODEL_LOCAL=""
+  fi
+fi
+
 # ── Stage prior checkpoints back down (preemption resume) ─────────────────────
 # On a preempted/retried job the local disk is fresh, so pull any checkpoints we
 # previously synced to GCS into CHECKPOINT_DIR. verl's resume_mode=auto then
@@ -168,6 +188,12 @@ HYDRA_ARGS+=(
   trainer.default_local_dir="${CHECKPOINT_DIR}"
   trainer.resume_mode="${RESUME_MODE:-auto}"
 )
+
+# If a base model was staged from GCS, point the actor at the local copy (wins
+# over any actor_rollout_ref.model.path in HYDRA_OVERRIDES).
+if [[ -n "${MODEL_LOCAL}" ]]; then
+  HYDRA_ARGS+=(actor_rollout_ref.model.path="${MODEL_LOCAL}")
+fi
 
 echo "Starting LOTIS training: exp=${EXP_NAME} n_gpus=${N_GPUS}"
 printf '  %s\n' "${HYDRA_ARGS[@]}"

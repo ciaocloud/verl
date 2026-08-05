@@ -41,7 +41,7 @@ workerPoolSpecs:
             custom_reward_function.name=compute_score
             algorithm.adv_estimator=grpo
             algorithm.use_kl_in_reward=False
-            data.train_batch_size=16
+            data.train_batch_size=256
             data.max_prompt_length=512
             data.max_response_length=1024
             data.filter_overlong_prompts=True
@@ -83,6 +83,6 @@ workerPoolSpecs:
             trainer.test_freq=1
             trainer.total_training_steps=2
 
+enableWebAccess: true
 scheduling:
   timeout: 3600s
-  

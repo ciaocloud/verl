@@ -108,16 +108,28 @@ sync_to_gcs() {
 # the var is unset, we skip and rely on the GCS mirror only.
 #   VERTEX_TENSORBOARD_RESOURCE_NAME = projects/<num>/locations/<region>/tensorboards/<id>
 #   VERTEX_TENSORBOARD_EXPERIMENT_NAME defaults to EXP_NAME (one experiment per run).
+# Vertex TB experiment IDs must match ^[a-z0-9][a-z0-9-]*$ (no uppercase, no
+# dots). EXP_NAME (e.g. lotis-0.5B-gsm8k-080509) violates this, so derive a valid
+# ID for --experiment_name while keeping EXP_NAME as the human display name.
+tb_experiment_id() {
+  local raw="${VERTEX_TENSORBOARD_EXPERIMENT_NAME:-${EXP_NAME}}"
+  raw="$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
+  raw="${raw##-}"                      # strip leading hyphens (must start alnum)
+  printf '%s' "${raw:-exp}"
+}
+
 upload_tensorboard_once() {
   [[ -n "${VERTEX_TENSORBOARD_RESOURCE_NAME:-}" ]] || return 0
   command -v tb-gcp-uploader >/dev/null 2>&1 || return 0
-  local exp_name="${VERTEX_TENSORBOARD_EXPERIMENT_NAME:-${EXP_NAME}}"
-  local to="${TENSORBOARD_FINAL_UPLOAD_TIMEOUT_SECONDS:-120}"
-  echo "Final TensorBoard flush to ${VERTEX_TENSORBOARD_RESOURCE_NAME} experiment ${exp_name} (timeout ${to}s)"
+  local exp_id to
+  exp_id="$(tb_experiment_id)"
+  to="${TENSORBOARD_FINAL_UPLOAD_TIMEOUT_SECONDS:-120}"
+  echo "Final TensorBoard flush to ${VERTEX_TENSORBOARD_RESOURCE_NAME} experiment ${exp_id} (timeout ${to}s)"
   timeout "${to}" tb-gcp-uploader \
     --tensorboard_resource_name "${VERTEX_TENSORBOARD_RESOURCE_NAME}" \
     --logdir "${TENSORBOARD_DIR}" \
-    --experiment_name "${exp_name}" \
+    --experiment_name "${exp_id}" \
+    --experiment_display_name "${EXP_NAME}" \
     --one_shot=True || true
 }
 
@@ -185,14 +197,14 @@ export TENSORBOARD_DIR
 # a final --one_shot flush. No-op unless VERTEX_TENSORBOARD_RESOURCE_NAME is set.
 tb_upload_pid=""
 if [[ -n "${VERTEX_TENSORBOARD_RESOURCE_NAME:-}" ]]; then
-  VERTEX_TENSORBOARD_EXPERIMENT_NAME="${VERTEX_TENSORBOARD_EXPERIMENT_NAME:-${EXP_NAME}}"
   if command -v tb-gcp-uploader >/dev/null 2>&1; then
-    echo "Streaming TensorBoard to ${VERTEX_TENSORBOARD_RESOURCE_NAME} experiment ${VERTEX_TENSORBOARD_EXPERIMENT_NAME}"
+    TB_EXP_ID="$(tb_experiment_id)"
+    echo "Streaming TensorBoard to ${VERTEX_TENSORBOARD_RESOURCE_NAME} experiment ${TB_EXP_ID} (display ${EXP_NAME})"
     tb-gcp-uploader \
       --tensorboard_resource_name "${VERTEX_TENSORBOARD_RESOURCE_NAME}" \
       --logdir "${TENSORBOARD_DIR}" \
-      --experiment_name "${VERTEX_TENSORBOARD_EXPERIMENT_NAME}" \
-      --experiment_display_name "${VERTEX_TENSORBOARD_EXPERIMENT_NAME}" &
+      --experiment_name "${TB_EXP_ID}" \
+      --experiment_display_name "${EXP_NAME}" &
     tb_upload_pid=$!
   else
     echo "VERTEX_TENSORBOARD_RESOURCE_NAME set but tb-gcp-uploader not found; GCS sync only." >&2
